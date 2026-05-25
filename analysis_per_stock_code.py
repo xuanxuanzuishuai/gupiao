@@ -4,7 +4,6 @@ import datetime as dt
 import io
 import json
 import math
-import os
 import re
 import sys
 import time
@@ -25,9 +24,12 @@ REALTIME_SOURCE_URL = "https://hq.sinajs.cn/list={symbols}"
 REALTIME_FALLBACK_SOURCE_NAME = "tencent_quote"
 REALTIME_FALLBACK_SOURCE_URL = "https://qt.gtimg.cn/q={symbol}"
 REALTIME_PREV_CLOSE_TOLERANCE_PCT = 0.5
-OPENAI_DIRECT_ANSWER_MODEL_DEFAULT = "gpt-5.4-mini"
-OPENAI_DIRECT_ANSWER_TIMEOUT_SECONDS = 12
-_DOTENV_LOADED = False
+ADAPTIVE_DROP_MIN_HISTORY_ROWS = 30
+ADAPTIVE_DROP_MIN_EVENT_ROWS = 6
+ADAPTIVE_DROP_MIN_GROUP_ROWS = 3
+ADAPTIVE_DROP_TRIGGER_PERCENTILE = 40.0
+ADAPTIVE_DROP_SHARP_PERCENTILE = 25.0
+ADAPTIVE_DROP_EXTREME_PERCENTILE = 10.0
 
 
 def _build_status_emitter(enabled=False):
@@ -48,29 +50,6 @@ def _build_status_emitter(enabled=False):
         last_at = now
 
     return emit
-
-
-def _load_local_env():
-    global _DOTENV_LOADED
-    if _DOTENV_LOADED:
-        return
-    _DOTENV_LOADED = True
-    env_path = os.path.join(os.getcwd(), ".env")
-    if not os.path.exists(env_path):
-        return
-    try:
-        with open(env_path, "r", encoding="utf-8") as env_file:
-            for line in env_file:
-                text = line.strip()
-                if not text or text.startswith("#") or "=" not in text:
-                    continue
-                key, value = text.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key and key not in os.environ:
-                    os.environ[key] = value
-    except OSError:
-        return
 
 
 def _round(value, digits=2):
@@ -155,6 +134,141 @@ def _number(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _ratio_pct_series(numerator, denominator):
+    numerator = pd.to_numeric(numerator, errors="coerce")
+    denominator = pd.to_numeric(denominator, errors="coerce").replace(0, pd.NA)
+    return (numerator / denominator - 1) * 100
+
+
+def _percentile_rank_lower(series, value):
+    value = _number(value)
+    if value is None:
+        return None
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float((values <= value).mean() * 100)
+
+
+def _avg_return_stats(frame, return_col="forward_return_5d"):
+    if frame is None or frame.empty or return_col not in frame.columns:
+        return {"count": 0, "avg_return": None, "win_rate": None}
+    returns = pd.to_numeric(frame[return_col], errors="coerce").dropna()
+    if returns.empty:
+        return {"count": 0, "avg_return": None, "win_rate": None}
+    return {
+        "count": int(len(returns)),
+        "avg_return": _round(returns.mean(), 2),
+        "win_rate": _round((returns > 0).mean() * 100, 2),
+    }
+
+
+def _build_adaptive_drop_event_stats(events):
+    if events is None or events.empty:
+        return {
+            "event_count": 0,
+            "evaluated_count": 0,
+            "recovered": _avg_return_stats(pd.DataFrame()),
+            "unrecovered": _avg_return_stats(pd.DataFrame()),
+            "all": _avg_return_stats(pd.DataFrame()),
+            "has_support": False,
+        }
+
+    if "forward_return_5d" not in events.columns:
+        evaluated = events.iloc[0:0].copy()
+    else:
+        evaluated = events[pd.to_numeric(events["forward_return_5d"], errors="coerce").notna()].copy()
+    recovered_flag = (
+        evaluated["recovered_key_line"].fillna(False)
+        if "recovered_key_line" in evaluated.columns
+        else pd.Series(False, index=evaluated.index)
+    )
+    recovered = evaluated[recovered_flag].copy()
+    unrecovered = evaluated[~recovered_flag].copy()
+    return {
+        "event_count": int(len(events)),
+        "evaluated_count": int(len(evaluated)),
+        "recovered": _avg_return_stats(recovered),
+        "unrecovered": _avg_return_stats(unrecovered),
+        "all": _avg_return_stats(evaluated),
+        "has_support": bool(len(evaluated) >= ADAPTIVE_DROP_MIN_EVENT_ROWS),
+    }
+
+
+def _build_adaptive_drop_profile(target, prepared, trade_date):
+    if prepared is None or prepared.empty:
+        return {"enabled": False, "reason": "history_empty"}
+
+    stock_code = adaptive._normalize_stock_code(target.get("stock_code"))
+    history = prepared[prepared["stock_code"] == stock_code].copy()
+    if history.empty:
+        return {"enabled": False, "reason": "stock_history_empty"}
+
+    trade_date_text = _date_text(trade_date)
+    history["last_data_date_text"] = history["last_data_date"].apply(_date_text)
+    if trade_date_text:
+        history = history[history["last_data_date_text"] <= trade_date_text].copy()
+    history = history.sort_values("last_data_date").reset_index(drop=True)
+    if len(history) < ADAPTIVE_DROP_MIN_HISTORY_ROWS:
+        return {
+            "enabled": False,
+            "reason": "insufficient_history",
+            "sample_rows": int(len(history)),
+            "min_rows": ADAPTIVE_DROP_MIN_HISTORY_ROWS,
+        }
+
+    history["prev_close"] = pd.to_numeric(history["latest_price"], errors="coerce").shift(1)
+    history["prior_low"] = pd.to_numeric(history["today_low"], errors="coerce").shift(1)
+    history["low_from_prev_pct"] = _ratio_pct_series(history["today_low"], history["prev_close"])
+    close_change = pd.to_numeric(history.get("today_change"), errors="coerce")
+    history["close_from_prev_pct"] = close_change.where(
+        close_change.notna(),
+        _ratio_pct_series(history["latest_price"], history["prev_close"]),
+    )
+    history["recovered_prior_low"] = pd.to_numeric(history["latest_price"], errors="coerce") >= pd.to_numeric(
+        history["prior_low"], errors="coerce"
+    )
+    history["recovered_ma5"] = pd.to_numeric(history["latest_price"], errors="coerce") >= pd.to_numeric(
+        history["ma5"], errors="coerce"
+    )
+    history["recovered_key_line"] = history["recovered_prior_low"].fillna(False) & history["recovered_ma5"].fillna(False)
+
+    low_series = pd.to_numeric(history["low_from_prev_pct"], errors="coerce").dropna()
+    if len(low_series) < ADAPTIVE_DROP_MIN_HISTORY_ROWS:
+        return {
+            "enabled": False,
+            "reason": "insufficient_low_samples",
+            "sample_rows": int(len(low_series)),
+            "min_rows": ADAPTIVE_DROP_MIN_HISTORY_ROWS,
+        }
+
+    q10 = float(low_series.quantile(ADAPTIVE_DROP_EXTREME_PERCENTILE / 100))
+    q25 = float(low_series.quantile(ADAPTIVE_DROP_SHARP_PERCENTILE / 100))
+    q40 = float(low_series.quantile(ADAPTIVE_DROP_TRIGGER_PERCENTILE / 100))
+    event_pool = history[pd.to_numeric(history["low_from_prev_pct"], errors="coerce") <= q40].copy()
+    sharp_pool = history[pd.to_numeric(history["low_from_prev_pct"], errors="coerce") <= q25].copy()
+    extreme_pool = history[pd.to_numeric(history["low_from_prev_pct"], errors="coerce") <= q10].copy()
+
+    return {
+        "enabled": True,
+        "sample_rows": int(len(low_series)),
+        "sample_start": history["last_data_date_text"].dropna().min(),
+        "sample_end": history["last_data_date_text"].dropna().max(),
+        "trigger_percentile": ADAPTIVE_DROP_TRIGGER_PERCENTILE,
+        "sharp_percentile": ADAPTIVE_DROP_SHARP_PERCENTILE,
+        "extreme_percentile": ADAPTIVE_DROP_EXTREME_PERCENTILE,
+        "trigger_low_pct": _round(q40, 2),
+        "sharp_low_pct": _round(q25, 2),
+        "extreme_low_pct": _round(q10, 2),
+        "low_samples": [float(value) for value in low_series.tolist()],
+        "event_stats": {
+            "trigger": _build_adaptive_drop_event_stats(event_pool),
+            "sharp": _build_adaptive_drop_event_stats(sharp_pool),
+            "extreme": _build_adaptive_drop_event_stats(extreme_pool),
+        },
+    }
 
 
 def _score_single_record(record, horizon_profiles, style_horizon_profiles):
@@ -1150,7 +1264,7 @@ def _build_execution_scenarios(candidate, trade_plan, formal_candidate, a_share_
         "weak_open": f"若低开接近或超过2%（约低于{weak_open_price}），先观察是否快速收回；不能收回则不买。",
         "stop_break": f"若跌破防守价{stop_text}且不能快速收回，已有仓位减仓或退出，无仓不参与。",
         "take_profit": f"到达止盈区间{trade_plan.get('expected_return')}后，若放量滞涨或上影线变长，优先分批兑现。",
-        "intraday_condition": f"当前日内状态为{tape_grade or '未知'}，次日必须观察集合竞价和开盘15分钟承接。",
+        "intraday_condition": f"当前日内状态为{tape_grade or '未知'}，次日必须观察集合竞价后能否守住关键支撑并恢复承接。",
     }
 
 
@@ -1286,7 +1400,7 @@ def _build_buy_entry_strategy(
             "status": open_status,
             "trigger": (
                 f"只接受平开到小高开，参考不高于{_price_text(high_open_price)}；"
-                f"开盘15分钟不破{_price_text(support_price)}附近支撑，且成交额/换手不是明显缩量。"
+                f"开盘后不破{_price_text(support_price)}附近支撑，且成交额/换手不是明显缩量。"
             ),
             "action": (
                 "正式推荐才可用计划仓位的三分之一先试；观察候选和研究价值不使用开盘直接买。"
@@ -1310,7 +1424,7 @@ def _build_buy_entry_strategy(
             "status": acceptance_status,
             "trigger": (
                 "需要同时满足：高开不过度或高开后主动回踩；回踩不破关键支撑；"
-                "开盘15-30分钟内能收回开盘价/分时均线；量能温和放大而不是缩量拉升。"
+                "开盘后能收回开盘价/分时均线；量能温和放大而不是缩量拉升。"
             ),
             "action": (
                 f"这是最贴近当前模型的执行方式。满足后按{trade_plan.get('position_hint')}以内执行；"
@@ -1655,9 +1769,40 @@ def _build_liquidity_view(candidate, a_share_profile):
     }
 
 
+def _signed_points(value):
+    value = _number(value) or 0.0
+    return f"{value:+.2f}"
+
+
+def _component_label(name, detail=None):
+    return f"{name}({detail})" if detail not in (None, "") else name
+
+
+def _scorecard_component_text(scorecard):
+    components = (scorecard or {}).get("components") or []
+    if not components:
+        return "；".join((scorecard or {}).get("details") or [])
+    return "；".join(item.get("text") or "" for item in components if item.get("text"))
+
+
 def _scorecard(formal_candidate, evidence, industry_view, market, candidate, intraday_view=None, liquidity_view=None):
-    score = 0
-    details = []
+    score = 0.0
+    components = []
+
+    def add_component(name, points, detail=None):
+        nonlocal score
+        points = _number(points) or 0.0
+        score += points
+        rounded_points = _round(points, 2)
+        text = f"{_component_label(name, detail)}{_signed_points(rounded_points)}"
+        components.append(
+            {
+                "name": name,
+                "points": rounded_points,
+                "detail": detail,
+                "text": text,
+            }
+        )
 
     risk_adjusted_score = _number(candidate.get("risk_adjusted_score"))
     risk_score = _number(candidate.get("risk_score"))
@@ -1669,55 +1814,65 @@ def _scorecard(formal_candidate, evidence, industry_view, market, candidate, int
     tape_grade = (intraday_view or {}).get("tape_grade")
     liquidity_grade = (liquidity_view or {}).get("grade")
 
-    if formal_candidate:
-        score += 25
-        details.append("进入系统正式推荐 +25")
+    add_component("正式推荐", 25 if formal_candidate else 0, "是" if formal_candidate else "否")
     if risk_adjusted_score is not None:
-        score += max(0, min(25, (risk_adjusted_score - 55) / 25 * 25))
-        details.append(f"风险调整分{_round(risk_adjusted_score, 2)}")
+        risk_adjusted_points = max(0, min(25, (risk_adjusted_score - 55) / 25 * 25))
+        add_component("风险调整分", risk_adjusted_points, _round(risk_adjusted_score, 2))
+    else:
+        add_component("风险调整分", 0, "缺失")
     if risk_score is not None:
         risk_points = max(0, 15 - risk_score * 4)
-        score += risk_points
-        details.append(f"风险分{_round(risk_score, 2)}")
+        add_component("风险分", risk_points, _round(risk_score, 2))
+    else:
+        add_component("风险分", 0, "缺失")
     if overlay_score:
         penalty = min(18, overlay_score * 1.2)
-        score -= penalty
-        details.append(f"基本面/事件/特殊池风险覆盖 -{_round(penalty, 1)}")
+        add_component("事件风险", -penalty, _round(overlay_score, 2))
     if overlay_block:
-        score -= 15
-        details.append("风险覆盖拦截系统正式推荐")
+        add_component("风险拦截", -15, "正式推荐拦截")
+
+    evidence_points = 0
     if evidence_grade == "强":
-        score += 20
+        evidence_points = 20
     elif evidence_grade == "中":
-        score += 14
+        evidence_points = 14
     elif evidence_grade == "弱":
-        score += 8
+        evidence_points = 8
+    add_component("证据", evidence_points, evidence_grade or "未知")
+
+    industry_points = 0
     if industry_grade == "强共振":
-        score += 4
+        industry_points = 4
     elif industry_grade == "中性偏强":
-        score += 2
+        industry_points = 2
     elif industry_grade == "偏弱":
-        score += 0
+        industry_points = 0
     elif industry_grade == "弱共振":
-        score -= 2
+        industry_points = -2
+    add_component("行业", industry_points, industry_grade or "未知")
+
+    market_points = 0
     if market_env in ("强势", "偏强"):
-        score += 5
+        market_points = 5
     elif market_env == "震荡":
-        score += 2
+        market_points = 2
     elif market_env == "偏弱":
-        score -= 5
+        market_points = -5
+    add_component("市场", market_points, market_env or "未知")
+
+    tape_points = 0
     if tape_grade == "承接较强":
-        score += 2
-        details.append("日内承接较强")
+        tape_points = 2
     elif tape_grade in ("冲高回落", "收盘偏弱"):
-        score -= 2
-        details.append(f"日内{tape_grade}")
+        tape_points = -2
+    add_component("日内", tape_points, tape_grade or "未知")
+
+    liquidity_points = 0
     if liquidity_grade == "流动性良好":
-        score += 4
-        details.append("流动性良好")
+        liquidity_points = 4
     elif liquidity_grade == "流动性有瑕疵":
-        score -= 6
-        details.append("流动性有瑕疵")
+        liquidity_points = -6
+    add_component("流动性", liquidity_points, liquidity_grade or "未知")
 
     score = _round(max(0, min(100, score)), 1)
     if score >= 80:
@@ -1732,7 +1887,8 @@ def _scorecard(formal_candidate, evidence, industry_view, market, candidate, int
     return {
         "score": score,
         "rating": rating,
-        "details": details,
+        "components": components,
+        "details": [item.get("text") for item in components if item.get("text")],
     }
 
 
@@ -2593,7 +2749,7 @@ def _join_level_text(items):
     return "、".join(item.get("text") or f"{item.get('name')}{item.get('price')}" for item in items)
 
 
-def _build_realtime_structure_view(mode, quote, day_tape, levels, target, has_formal_context=False):
+def _build_realtime_structure_view(mode, quote, day_tape, levels, target, has_trade_context=False):
     current = _number(quote.get("current"))
     open_price = _number(quote.get("open"))
     low_price = _number(quote.get("low"))
@@ -2621,10 +2777,8 @@ def _build_realtime_structure_view(mode, quote, day_tape, levels, target, has_fo
         _format_level_item("当日高点", high_price),
         _format_level_item("20日高点", high_20d),
     ]
-    if has_formal_context:
+    if has_trade_context:
         level_items.append(_format_level_item("有效防守", effective_stop))
-    else:
-        level_items.append(_format_level_item("模型参考防守", model_reference_stop))
 
     supports = _nearest_levels(current, level_items, "support")
     pressures = _nearest_levels(current, level_items, "pressure")
@@ -2690,6 +2844,8 @@ def _build_realtime_execution_view(
     strategy_memory_review,
     price_memory,
     latest_trade_date,
+    has_user_position=False,
+    adaptive_drop_profile=None,
 ):
     snapshot = _fetch_realtime_snapshot(stock_code)
     if not snapshot.get("success"):
@@ -2775,7 +2931,16 @@ def _build_realtime_execution_view(
     dynamic_stop = _number((holding_stop_view or {}).get("dynamic_stop_price"))
     model_reference_stop = effective_stop or _number(plan.get("defense_price")) or _number(trade_plan.get("stop_price"))
     has_formal_context = mode in {"entry_acceptance_check", "holding_management"}
-    defense_price = model_reference_stop if has_formal_context else None
+    has_trade_context = bool(has_formal_context or has_user_position)
+    if mode == "entry_acceptance_check":
+        context_label = "正式推荐承接验证"
+    elif mode == "holding_management":
+        context_label = "历史正式推荐持仓管理"
+    elif has_user_position:
+        context_label = "用户持仓风控"
+    else:
+        context_label = "无推荐观察"
+    defense_price = model_reference_stop if has_trade_context else None
     high_price = _number(quote.get("high"))
     low_price = _number(quote.get("low"))
     open_price = _number(quote.get("open"))
@@ -2817,6 +2982,10 @@ def _build_realtime_execution_view(
         "dynamic_stop": _round(dynamic_stop, 2),
         "model_reference_stop": _round(model_reference_stop, 2),
         "effective_stop": _round(defense_price, 2),
+        "has_trade_context": has_trade_context,
+        "has_formal_context": has_formal_context,
+        "has_user_position": bool(has_user_position),
+        "execution_context_label": context_label,
         "open_recovered": bool(quote_current is not None and open_price is not None and quote_current >= open_price),
         "above_ma5": bool(quote_current is not None and ma5 is not None and quote_current >= ma5),
         "above_ma10": bool(quote_current is not None and ma10 is not None and quote_current >= ma10),
@@ -2829,8 +2998,18 @@ def _build_realtime_execution_view(
         day_tape,
         key_levels,
         target,
-        has_formal_context=has_formal_context,
+        has_trade_context=has_trade_context,
     )
+    intraday_drop_view = _build_intraday_drop_view(
+        {"success": True, "quote": quote},
+        key_levels,
+        adaptive_drop_profile=adaptive_drop_profile,
+    )
+    repair_watch_text = None
+    if intraday_drop_view and intraday_drop_view.get("watch_text") != "关键线":
+        repair_watch_text = intraday_drop_view.get("watch_text")
+    elif structure_view.get("pressures"):
+        repair_watch_text = _join_level_text((structure_view.get("pressures") or [])[:2])
 
     warnings = []
     if quote.get("open_gap_pct") is not None and quote["open_gap_pct"] <= -2 and quote_current and quote_current < prev_close:
@@ -2884,8 +3063,22 @@ def _build_realtime_execution_view(
             holding_action = "先看有效防守和关键均线能否守住，未修复前不加仓。"
     else:
         decision = "无系统正式推荐实时观察"
-        no_position_action = "没有落库推荐上下文，实时拉升不转化为系统买点。"
-        holding_action = "若本来有仓，只按当日策略防守和均线结构管理。"
+        quote_change_pct = _number(quote.get("change_pct"))
+        if quote_change_pct is not None and quote_change_pct < 0:
+            no_position_action = "当前实时下跌且没有落库推荐，无仓不接下跌。"
+            if repair_watch_text:
+                holding_action = (
+                    f"若本来有仓，先看能否收复{repair_watch_text}；"
+                    "收不回不加仓，只按自己的成本/原计划风控处理。"
+                )
+            else:
+                holding_action = "若本来有仓，只按自己的成本/原计划风控处理；未收复关键线不加仓。"
+        elif quote_change_pct is not None and quote_change_pct > 0:
+            no_position_action = "没有落库推荐上下文，实时走强也不自动转化为系统买点。"
+            holding_action = "若本来有仓，只按自己的成本/原计划风控处理，不追着加仓。"
+        else:
+            no_position_action = "没有落库推荐上下文，无仓只观察，不主动开仓。"
+            holding_action = "若本来有仓，只按自己的成本/原计划风控处理。"
 
     return {
         "enabled": True,
@@ -2902,9 +3095,23 @@ def _build_realtime_execution_view(
         "no_position_action": no_position_action,
         "holding_action": holding_action,
         "warnings": warnings,
+        "execution_context": {
+            "mode": mode,
+            "label": context_label,
+            "has_trade_context": has_trade_context,
+            "has_formal_context": has_formal_context,
+            "has_user_position": bool(has_user_position),
+            "allow_stop_action": has_trade_context,
+        },
         "formal_context": formal_context,
         "day_tape": day_tape,
         "structure_view": structure_view,
+        "intraday_drop_view": intraday_drop_view,
+        "adaptive_drop_profile": {
+            key: value
+            for key, value in (adaptive_drop_profile or {}).items()
+            if key not in {"event_stats", "low_samples"}
+        },
         "realtime_acceptance": realtime_acceptance,
         "holding_metrics": {
             "entry_price": _round(entry_price, 2),
@@ -2919,163 +3126,6 @@ def _build_realtime_execution_view(
         },
         "key_levels": key_levels,
         "discipline_note": "实时层只复用承接确认、低开放弃、高开不追、防守和止盈纪律；不改历史评分、不写库、不参与回测。",
-    }
-
-
-def _env_flag_enabled(name, default=True):
-    _load_local_env()
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    return str(raw_value).strip().lower() not in {"0", "false", "no", "off", "关闭"}
-
-
-def _extract_response_text(response_data):
-    if not isinstance(response_data, dict):
-        return None
-    output_text = response_data.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-
-    parts = []
-    for item in response_data.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        for content in item.get("content") or []:
-            if not isinstance(content, dict):
-                continue
-            text = content.get("text")
-            if isinstance(text, str) and text.strip():
-                parts.append(text.strip())
-    return "\n".join(parts).strip() if parts else None
-
-
-def _compact_direct_answer_payload(result):
-    realtime = result.get("realtime_execution") or {}
-    model = result.get("model") or {}
-    trade_plan = result.get("trade_plan") or {}
-    memory = ((result.get("strategy_memory_review") or {}).get("summary") or {})
-    professional = result.get("professional_view") or {}
-    return {
-        "stock": {
-            "code": result.get("stock_code"),
-            "name": result.get("stock_name"),
-            "industry": result.get("industry"),
-            "local_base_date": realtime.get("local_base_date") or result.get("latest_trade_date"),
-        },
-        "system_context": {
-            "recommendation_tier": model.get("recommendation_tier"),
-            "formal_candidate": model.get("formal_candidate"),
-            "recent_formal_date": memory.get("latest_formal_date"),
-            "memory_guidance": memory.get("personal_guidance"),
-            "professional_stance": professional.get("stance"),
-            "risk_labels": model.get("risk_labels"),
-            "quality_fail_reasons": model.get("quality_fail_reasons"),
-        },
-        "trade_plan": {
-            "entry": trade_plan.get("entry"),
-            "stop_price": trade_plan.get("stop_price"),
-            "expected_return": trade_plan.get("expected_return"),
-            "hold_period": trade_plan.get("hold_period"),
-            "position_hint": trade_plan.get("position_hint"),
-        },
-        "realtime": {
-            "source": realtime.get("source"),
-            "quote": realtime.get("quote"),
-            "market_summary": realtime.get("market_summary"),
-            "mode": realtime.get("mode"),
-            "decision": realtime.get("decision"),
-            "no_position_action": realtime.get("no_position_action"),
-            "holding_action": realtime.get("holding_action"),
-            "warnings": realtime.get("warnings"),
-            "day_tape": realtime.get("day_tape"),
-            "structure_view": realtime.get("structure_view"),
-            "acceptance": realtime.get("realtime_acceptance"),
-            "holding_metrics": realtime.get("holding_metrics"),
-            "key_levels": realtime.get("key_levels"),
-            "data_consistency": realtime.get("data_consistency"),
-        },
-    }
-
-
-def _build_openai_direct_answer(result):
-    realtime = result.get("realtime_execution") or {}
-    if not realtime.get("success"):
-        return {}
-
-    if not _env_flag_enabled("OPENAI_DIRECT_ANSWER_ENABLED", default=True):
-        return {}
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {}
-
-    model = os.getenv("OPENAI_DIRECT_ANSWER_MODEL") or OPENAI_DIRECT_ANSWER_MODEL_DEFAULT
-    api_url = os.getenv("OPENAI_RESPONSES_URL") or "https://api.openai.com/v1/responses"
-    payload = _compact_direct_answer_payload(result)
-
-    system_prompt = (
-        "你是A股盘中执行纪律的中文解释器。你只能基于用户提供的结构化数据作答，"
-        "不得引入外部新闻、不得重新选股、不得推翻系统已有结论、不得编造价格。"
-        "你要把结构化结论改写成用户直接问你时的答案。"
-        "输出5到8句中文，必须包含：一句话结论、盘面理由、无仓动作、持仓动作、关键价位。"
-        "如果没有系统正式推荐，必须明确实时表现不自动转化为系统买点。"
-        "如果已进入或超过止盈区，必须强调兑现/移动止盈优先。"
-    )
-    user_prompt = (
-        "请基于以下JSON生成盘中直接回答。不要说“根据JSON”。"
-        "不要给免责声明，不要新增规则，只复述并解释已有纪律。\n"
-        + json.dumps(payload, ensure_ascii=False, default=str)
-    )
-
-    request_body = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_output_tokens": 600,
-    }
-
-    try:
-        import requests
-
-        response = requests.post(
-            api_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=request_body,
-            timeout=OPENAI_DIRECT_ANSWER_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        response_data = response.json()
-    except Exception as error:
-        return {
-            "enabled": True,
-            "success": False,
-            "source": "openai_responses_api",
-            "model": model,
-            "reason": f"{type(error).__name__}: {error}",
-        }
-
-    text = _extract_response_text(response_data)
-    if not text:
-        return {
-            "enabled": True,
-            "success": False,
-            "source": "openai_responses_api",
-            "model": model,
-            "reason": "empty_response_text",
-        }
-
-    return {
-        "enabled": True,
-        "success": True,
-        "source": "openai_responses_api",
-        "model": model,
-        "answer": text,
     }
 
 
@@ -3550,36 +3600,11 @@ def _build_holding_stop_view(
     }
 
 
-def analysis_per_stock_code(
-    stock_code,
-    analysis_date=None,
-    lookback_trade_days=90,
-    cost_price=None,
-    shares=None,
-    available_shares=None,
-    emit_status=False,
-    realtime=None,
-):
-    status = _build_status_emitter(emit_status)
-    normalized_code = adaptive._normalize_stock_code(stock_code)
-    if not normalized_code:
-        status(f"股票代码无效: {stock_code}")
-        return {
-            "success": False,
-            "reason": "invalid_stock_code",
-            "message": f"股票代码无效: {stock_code}",
-        }
-
-    status(
-        f"开始: stock_code={normalized_code}, "
-        f"analysis_date={analysis_date or 'latest'}, lookback={lookback_trade_days}, "
-        f"shares={shares if shares is not None else '--'}, "
-        f"available_shares={available_shares if available_shares is not None else '--'}"
-    )
+def _load_analysis_context(normalized_code, stock_code, analysis_date, lookback_trade_days, status):
     history = _load_history_window(analysis_date=analysis_date, lookback_trade_days=lookback_trade_days)
     status(f"历史窗口加载完成: rows={len(history)}")
     if history.empty:
-        return {
+        return None, {
             "success": False,
             "reason": "history_empty",
             "stock_code": normalized_code,
@@ -3589,7 +3614,7 @@ def analysis_per_stock_code(
     prepared = adaptive._prepare_short_term_history(history)
     status(f"特征准备完成: rows={len(prepared) if prepared is not None else 0}")
     if prepared is None or prepared.empty:
-        return {
+        return None, {
             "success": False,
             "reason": "prepared_history_empty",
             "stock_code": normalized_code,
@@ -3601,7 +3626,7 @@ def analysis_per_stock_code(
     latest_snapshot = prepared[prepared["last_data_date"] == latest_trade_date].copy()
     status(f"最新快照定位完成: trade_date={trade_date}, rows={len(latest_snapshot)}")
     if latest_snapshot.empty:
-        return {
+        return None, {
             "success": False,
             "reason": "snapshot_empty",
             "stock_code": normalized_code,
@@ -3612,7 +3637,7 @@ def analysis_per_stock_code(
     if stock_rows.empty:
         last_seen = prepared[prepared["stock_code"] == normalized_code]["last_data_date"].max()
         status(f"股票不在最新快照: last_seen={_date_text(last_seen)}")
-        return {
+        return None, {
             "success": False,
             "reason": "stock_not_in_latest_snapshot",
             "stock_code": normalized_code,
@@ -3623,8 +3648,30 @@ def analysis_per_stock_code(
 
     horizon_profiles, style_horizon_profiles = _build_profiles(prepared)
     status("自适应画像构建完成")
-    raw_record = stock_rows.iloc[0].to_dict()
-    target = _score_single_record(raw_record, horizon_profiles, style_horizon_profiles)
+    return {
+        "stock_code": stock_code,
+        "normalized_code": normalized_code,
+        "history": history,
+        "prepared": prepared,
+        "latest_trade_date": latest_trade_date,
+        "trade_date": trade_date,
+        "latest_snapshot": latest_snapshot,
+        "stock_rows": stock_rows,
+        "horizon_profiles": horizon_profiles,
+        "style_horizon_profiles": style_horizon_profiles,
+        "raw_record": stock_rows.iloc[0].to_dict(),
+    }, None
+
+
+def _score_stock_context(context, status):
+    normalized_code = context["normalized_code"]
+    prepared = context["prepared"]
+    latest_snapshot = context["latest_snapshot"]
+    trade_date = context["trade_date"]
+    horizon_profiles = context["horizon_profiles"]
+    style_horizon_profiles = context["style_horizon_profiles"]
+
+    target = _score_single_record(context["raw_record"], horizon_profiles, style_horizon_profiles)
     status(
         f"单票评分完成: adaptive_score={_round(target.get('adaptive_score'), 2)}, "
         f"risk_adjusted={_round(target.get('risk_adjusted_score'), 2)}"
@@ -3692,6 +3739,43 @@ def analysis_per_stock_code(
         trend_state=target.get("trend_state"),
         adaptive_score=target.get("adaptive_score"),
     )
+    return {
+        "target": target,
+        "market": market,
+        "saved_strategy": saved_strategy,
+        "recent_saved_strategy": recent_saved_strategy,
+        "strategy_memory": strategy_memory,
+        "price_memory": price_memory,
+        "strategy_memory_review": strategy_memory_review,
+        "saved_rank": saved_rank,
+        "saved_strategy_hint": saved_strategy_hint,
+        "recent_saved_strategy_hint": recent_saved_strategy_hint,
+        "precision_candidate": precision_candidate,
+        "evidence": evidence,
+        "recommendation_tier_info": recommendation_tier_info,
+        "recommendation_tier": recommendation_tier,
+        "formal_candidate": formal_candidate,
+        "industry_view": industry_view,
+        "a_share_profile": a_share_profile,
+        "intraday_view": intraday_view,
+        "liquidity_view": liquidity_view,
+        "style_name": style_name,
+        "style_label": style_label,
+        "trade_plan": trade_plan,
+    }
+
+
+def _build_execution_views(context, scored, cost_price, shares, available_shares, analysis_date, realtime, status):
+    target = scored["target"]
+    trade_plan = scored["trade_plan"]
+    market = scored["market"]
+    prepared = context["prepared"]
+    trade_date = context["trade_date"]
+    horizon_profiles = context["horizon_profiles"]
+    style_horizon_profiles = context["style_horizon_profiles"]
+    recommendation_tier = scored["recommendation_tier"]
+    formal_candidate = scored["formal_candidate"]
+
     holding_stop_view = _build_holding_stop_view(
         target,
         trade_plan,
@@ -3710,7 +3794,7 @@ def analysis_per_stock_code(
         trade_plan,
         recommendation_tier=recommendation_tier,
         formal_candidate=formal_candidate,
-        formal_rank=saved_rank,
+        formal_rank=scored["saved_rank"],
         holding_stop_view=holding_stop_view,
     )
     position_view = _build_position_view(
@@ -3723,17 +3807,17 @@ def analysis_per_stock_code(
         target,
         trade_plan,
         formal_candidate,
-        a_share_profile=a_share_profile,
-        intraday_view=intraday_view,
+        a_share_profile=scored["a_share_profile"],
+        intraday_view=scored["intraday_view"],
     )
     buy_entry_strategy = _build_buy_entry_strategy(
         target,
         trade_plan,
         recommendation_tier,
         formal_candidate=formal_candidate,
-        a_share_profile=a_share_profile,
-        intraday_view=intraday_view,
-        liquidity_view=liquidity_view,
+        a_share_profile=scored["a_share_profile"],
+        intraday_view=scored["intraday_view"],
+        liquidity_view=scored["liquidity_view"],
         market=market,
     )
     holding_t_strategy = _build_holding_t_strategy(
@@ -3742,8 +3826,8 @@ def analysis_per_stock_code(
         recommendation_tier,
         formal_candidate,
         position_view,
-        intraday_view,
-        liquidity_view,
+        scored["intraday_view"],
+        scored["liquidity_view"],
         market,
         shares=shares,
         available_shares=available_shares,
@@ -3758,26 +3842,26 @@ def analysis_per_stock_code(
         recommendation_tier,
         formal_candidate,
         market,
-        intraday_view,
-        liquidity_view,
+        scored["intraday_view"],
+        scored["liquidity_view"],
     )
     scorecard = _scorecard(
         formal_candidate,
-        evidence,
-        industry_view,
+        scored["evidence"],
+        scored["industry_view"],
         market,
         target,
-        intraday_view=intraday_view,
-        liquidity_view=liquidity_view,
+        intraday_view=scored["intraday_view"],
+        liquidity_view=scored["liquidity_view"],
     )
     professional_view = _build_professional_view(
         formal_candidate,
-        evidence,
+        scored["evidence"],
         market,
-        industry_view=industry_view,
+        industry_view=scored["industry_view"],
         scorecard=scorecard,
-        intraday_view=intraday_view,
-        liquidity_view=liquidity_view,
+        intraday_view=scored["intraday_view"],
+        liquidity_view=scored["liquidity_view"],
         recommendation_tier=recommendation_tier,
         risk_overlay_view={
             "score": target.get("risk_overlay_score"),
@@ -3786,7 +3870,7 @@ def analysis_per_stock_code(
             "block_formal": target.get("risk_overlay_block_formal"),
             "downgrade": target.get("risk_overlay_downgrade"),
         },
-        recent_saved_strategy=recent_saved_strategy,
+        recent_saved_strategy=scored["recent_saved_strategy"],
     )
     attack_defense_lines = _build_attack_defense_lines(
         target,
@@ -3799,18 +3883,21 @@ def analysis_per_stock_code(
         professional_view,
         position_view,
     )
+    adaptive_drop_profile = _build_adaptive_drop_profile(target, prepared, trade_date)
     realtime_execution = {}
     should_fetch_realtime = (analysis_date is None) if realtime is None else bool(realtime)
     if should_fetch_realtime:
         status("实时盘中覆盖开始")
         realtime_execution = _build_realtime_execution_view(
-            normalized_code,
+            context["normalized_code"],
             target,
             trade_plan,
             holding_stop_view,
-            strategy_memory_review,
-            price_memory,
+            scored["strategy_memory_review"],
+            scored["price_memory"],
             trade_date,
+            has_user_position=bool(cost_price is not None or shares is not None or available_shares is not None),
+            adaptive_drop_profile=adaptive_drop_profile,
         )
         if realtime_execution.get("success"):
             quote = realtime_execution.get("quote") or {}
@@ -3820,25 +3907,47 @@ def analysis_per_stock_code(
             )
         else:
             status(f"实时盘中覆盖不可用: {realtime_execution.get('reason') or '--'}")
-            realtime_execution = {}
 
-    result = {
+    return {
+        "holding_stop_view": holding_stop_view,
+        "holding_trade_plan": holding_trade_plan,
+        "operation": operation,
+        "position_view": position_view,
+        "execution_scenarios": execution_scenarios,
+        "buy_entry_strategy": buy_entry_strategy,
+        "holding_t_strategy": holding_t_strategy,
+        "position_action_plan": position_action_plan,
+        "scorecard": scorecard,
+        "professional_view": professional_view,
+        "attack_defense_lines": attack_defense_lines,
+        "realtime_execution": realtime_execution,
+    }
+
+
+def _build_analysis_result(context, scored, views):
+    target = scored["target"]
+    trade_plan = scored["trade_plan"]
+    holding_stop_view = views["holding_stop_view"]
+    recommendation_tier = scored["recommendation_tier"]
+    formal_candidate = scored["formal_candidate"]
+
+    return {
         "success": True,
-        "stock_code": normalized_code,
+        "stock_code": context["normalized_code"],
         "stock_name": target.get("stock_name"),
         "industry": target.get("industry_1"),
-        "latest_trade_date": trade_date,
-        "sample_start": _date_text(prepared["last_data_date"].min()),
-        "sample_end": _date_text(prepared["last_data_date"].max()),
-        "sample_trade_days": int(prepared["last_data_date"].nunique()),
-        "market": market,
+        "latest_trade_date": context["trade_date"],
+        "sample_start": _date_text(context["prepared"]["last_data_date"].min()),
+        "sample_end": _date_text(context["prepared"]["last_data_date"].max()),
+        "sample_trade_days": int(context["prepared"]["last_data_date"].nunique()),
+        "market": scored["market"],
         "key_data": _summarize_key_data(target),
         "model": {
             "adaptive_score": _round(target.get("adaptive_score"), 2),
             "risk_adjusted_score": _round(target.get("risk_adjusted_score"), 2),
             "risk_score": _round(target.get("risk_score"), 2),
-            "style": style_name,
-            "style_label": style_label,
+            "style": scored["style_name"],
+            "style_label": scored["style_label"],
             "trend_state": target.get("trend_state"),
             "trend_detail": target.get("trend_detail"),
             "dominant_horizon": target.get("dominant_horizon"),
@@ -3847,33 +3956,33 @@ def analysis_per_stock_code(
             "family_scores": target.get("family_scores") or {},
             "coverage": _round(target.get("coverage"), 4),
             "formal_candidate": formal_candidate,
-            "precision_gate_candidate": precision_candidate,
+            "precision_gate_candidate": scored["precision_candidate"],
             "recommendation_tier": recommendation_tier,
-            "recommendation_tier_reason": recommendation_tier_info["reason"],
-            "formal_candidate_rank": saved_rank,
-            "saved_strategy_hint": saved_strategy_hint,
-            "recent_saved_strategy_hint": recent_saved_strategy_hint,
+            "recommendation_tier_reason": scored["recommendation_tier_info"]["reason"],
+            "formal_candidate_rank": scored["saved_rank"],
+            "saved_strategy_hint": scored["saved_strategy_hint"],
+            "recent_saved_strategy_hint": scored["recent_saved_strategy_hint"],
             "quality_fail_reasons": _build_fail_reasons(target),
             "reason": target.get("reason"),
             "risk_labels": target.get("risk_labels"),
             "no_buy_condition": target.get("no_buy_condition"),
         },
-        "operation": operation,
-        "professional_view": professional_view,
-        "scorecard": scorecard,
-        "evidence": evidence,
-        "industry_view": industry_view,
-        "a_share_profile": a_share_profile,
-        "intraday_view": intraday_view,
-        "liquidity_view": liquidity_view,
-        "position_view": position_view,
+        "operation": views["operation"],
+        "professional_view": views["professional_view"],
+        "scorecard": views["scorecard"],
+        "evidence": scored["evidence"],
+        "industry_view": scored["industry_view"],
+        "a_share_profile": scored["a_share_profile"],
+        "intraday_view": scored["intraday_view"],
+        "liquidity_view": scored["liquidity_view"],
+        "position_view": views["position_view"],
         "holding_stop": holding_stop_view,
-        "position_action_plan": position_action_plan,
-        "attack_defense_lines": attack_defense_lines,
-        "holding_t_strategy": holding_t_strategy,
-        "execution_scenarios": execution_scenarios,
-        "buy_entry_strategy": buy_entry_strategy,
-        "realtime_execution": realtime_execution,
+        "position_action_plan": views["position_action_plan"],
+        "attack_defense_lines": views["attack_defense_lines"],
+        "holding_t_strategy": views["holding_t_strategy"],
+        "execution_scenarios": views["execution_scenarios"],
+        "buy_entry_strategy": views["buy_entry_strategy"],
+        "realtime_execution": views["realtime_execution"],
         "risk_overlay": {
             "score": _round(target.get("risk_overlay_score"), 2),
             "level": target.get("risk_overlay_level"),
@@ -3907,33 +4016,73 @@ def analysis_per_stock_code(
             "hold_period": trade_plan.get("hold_period"),
             "position_hint": trade_plan.get("position_hint"),
             "full_note": trade_plan.get("conclusion"),
-            "entry_strategy_note": buy_entry_strategy.get("full_text"),
+            "entry_strategy_note": views["buy_entry_strategy"].get("full_text"),
         },
-        "saved_strategy": saved_strategy,
-        "saved_strategy_hint": saved_strategy_hint,
-        "recent_saved_strategy": recent_saved_strategy,
-        "recent_saved_strategy_hint": recent_saved_strategy_hint,
-        "strategy_memory_review": strategy_memory_review,
-        "ai_direct_answer": {},
+        "saved_strategy": scored["saved_strategy"],
+        "saved_strategy_hint": scored["saved_strategy_hint"],
+        "recent_saved_strategy": scored["recent_saved_strategy"],
+        "recent_saved_strategy_hint": scored["recent_saved_strategy_hint"],
+        "strategy_memory_review": scored["strategy_memory_review"],
         "analyst_note": (
             "这是基于本地历史行情、全市场横截面评分和自适应模型的研究辅助结论；"
             "最终交易仍需结合你的仓位、成本和风险承受能力。"
         ),
     }
-    if realtime_execution.get("success"):
-        status("AI直接回答开始")
-        result["ai_direct_answer"] = _build_openai_direct_answer(result)
-        ai_answer = result.get("ai_direct_answer") or {}
-        if ai_answer.get("success"):
-            status(f"AI直接回答完成: model={ai_answer.get('model')}")
-        elif ai_answer.get("enabled"):
-            status(f"AI直接回答失败: {ai_answer.get('reason') or '--'}")
-        else:
-            status("AI直接回答跳过: 未配置OPENAI_API_KEY或未启用")
+
+
+def analysis_per_stock_code(
+    stock_code,
+    analysis_date=None,
+    lookback_trade_days=90,
+    cost_price=None,
+    shares=None,
+    available_shares=None,
+    emit_status=False,
+    realtime=None,
+):
+    status = _build_status_emitter(emit_status)
+    normalized_code = adaptive._normalize_stock_code(stock_code)
+    if not normalized_code:
+        status(f"股票代码无效: {stock_code}")
+        return {
+            "success": False,
+            "reason": "invalid_stock_code",
+            "message": f"股票代码无效: {stock_code}",
+        }
+
     status(
-        f"完成: tier={recommendation_tier}, formal={formal_candidate}, "
-        f"decision={operation.get('decision')}, "
-        f"t_direction={holding_t_strategy.get('direction')}"
+        f"开始: stock_code={normalized_code}, "
+        f"analysis_date={analysis_date or 'latest'}, lookback={lookback_trade_days}, "
+        f"shares={shares if shares is not None else '--'}, "
+        f"available_shares={available_shares if available_shares is not None else '--'}"
+    )
+
+    context, failure = _load_analysis_context(
+        normalized_code,
+        stock_code,
+        analysis_date,
+        lookback_trade_days,
+        status,
+    )
+    if failure:
+        return failure
+
+    scored = _score_stock_context(context, status)
+    views = _build_execution_views(
+        context,
+        scored,
+        cost_price,
+        shares,
+        available_shares,
+        analysis_date,
+        realtime,
+        status,
+    )
+    result = _build_analysis_result(context, scored, views)
+    status(
+        f"完成: tier={scored['recommendation_tier']}, formal={scored['formal_candidate']}, "
+        f"decision={views['operation'].get('decision')}, "
+        f"t_direction={views['holding_t_strategy'].get('direction')}"
     )
     return result
 
@@ -3942,6 +4091,259 @@ def _as_text(value, suffix=""):
     if value is None:
         return "--"
     return f"{value}{suffix}"
+
+
+def _quote_current_label(quote):
+    quote_datetime = (quote or {}).get("quote_datetime")
+    if not quote_datetime:
+        return "当前"
+    try:
+        time_text = str(quote_datetime).split()[-1]
+        quote_time = dt.datetime.strptime(time_text[:8], "%H:%M:%S").time()
+        if quote_time >= dt.time(15, 0):
+            return "收盘"
+    except (ValueError, TypeError):
+        pass
+    return "当前"
+
+
+def _format_named_level(name, price):
+    return f"{name} {_as_text(price)}" if name else _as_text(price)
+
+
+def _append_unique_level(levels, name, price):
+    if price is None:
+        return
+    rounded_price = _round(price, 2)
+    key = (name, rounded_price)
+    if any(item.get("key") == key for item in levels):
+        return
+    levels.append({"name": name, "price": rounded_price, "key": key})
+
+
+def _build_intraday_drop_view(realtime, levels, adaptive_drop_profile=None):
+    if not (realtime or {}).get("success"):
+        return None
+
+    quote = realtime.get("quote") or {}
+    low_from_prev = _number(quote.get("low_from_prev_pct"))
+    current_change = _number(quote.get("change_pct"))
+    profile = adaptive_drop_profile or {}
+    if low_from_prev is None or not profile.get("enabled"):
+        return None
+
+    trigger_rank = _number(profile.get("trigger_percentile")) or ADAPTIVE_DROP_TRIGGER_PERCENTILE
+    sharp_rank = _number(profile.get("sharp_percentile")) or ADAPTIVE_DROP_SHARP_PERCENTILE
+    extreme_rank = _number(profile.get("extreme_percentile")) or ADAPTIVE_DROP_EXTREME_PERCENTILE
+    trigger_low_pct = _number(profile.get("trigger_low_pct"))
+    sharp_low_pct = _number(profile.get("sharp_low_pct"))
+    extreme_low_pct = _number(profile.get("extreme_low_pct"))
+    low_samples = profile.get("low_samples") or []
+    drop_percentile = _percentile_rank_lower(pd.Series(low_samples), low_from_prev) if low_samples else None
+    is_triggered = (
+        drop_percentile <= trigger_rank
+        if drop_percentile is not None
+        else trigger_low_pct is not None and low_from_prev <= trigger_low_pct
+    )
+    if not is_triggered:
+        return None
+
+    if drop_percentile is not None:
+        if drop_percentile <= extreme_rank:
+            event_bucket = "extreme"
+            severity = "历史极端回撤"
+        elif drop_percentile <= sharp_rank:
+            event_bucket = "sharp"
+            severity = "历史偏深回撤"
+        else:
+            event_bucket = "trigger"
+            severity = "历史明显回撤"
+    elif extreme_low_pct is not None and low_from_prev <= extreme_low_pct:
+        event_bucket = "extreme"
+        severity = "历史极端回撤"
+    elif sharp_low_pct is not None and low_from_prev <= sharp_low_pct:
+        event_bucket = "sharp"
+        severity = "历史偏深回撤"
+    else:
+        event_bucket = "trigger"
+        severity = "历史明显回撤"
+
+    current_price = _number(quote.get("current"))
+    low_price = _number(quote.get("low"))
+    has_trade_context = bool(levels.get("has_trade_context"))
+    stop_price = _number(levels.get("effective_stop") or levels.get("model_reference_stop")) if has_trade_context else None
+    prior_low = _number(levels.get("prior_low"))
+    ma5 = _number(levels.get("ma5"))
+    ma10 = _number(levels.get("ma10"))
+    ma20 = _number(levels.get("ma20"))
+
+    stop_touched = bool(stop_price is not None and low_price is not None and low_price <= stop_price)
+    stop_broken_now = bool(stop_price is not None and current_price is not None and current_price <= stop_price)
+
+    watch_levels = []
+    if stop_touched:
+        _append_unique_level(watch_levels, "有效防守", stop_price)
+    else:
+        if prior_low is not None and low_price is not None and low_price <= prior_low:
+            _append_unique_level(watch_levels, "前一日低点", prior_low)
+        if ma5 is not None and low_price is not None and low_price <= ma5:
+            _append_unique_level(watch_levels, "MA5", ma5)
+        if not watch_levels and ma10 is not None and low_price is not None and low_price <= ma10:
+            _append_unique_level(watch_levels, "MA10", ma10)
+        if not watch_levels and ma20 is not None and low_price is not None and low_price <= ma20:
+            _append_unique_level(watch_levels, "MA20", ma20)
+        if not watch_levels:
+            _append_unique_level(watch_levels, "有效防守", stop_price)
+
+    watch_levels = watch_levels[:2]
+    watch_prices = [item["price"] for item in watch_levels if item.get("price") is not None]
+    watch_text = " / ".join(_format_named_level(item.get("name"), item.get("price")) for item in watch_levels) or "关键线"
+    recovered_watch = bool(current_price is not None and watch_prices and current_price >= max(watch_prices))
+
+    recovery_points = None
+    recovery_ratio = None
+    if current_change is not None:
+        recovery_points = current_change - low_from_prev
+        if low_from_prev < 0:
+            recovery_ratio = recovery_points / abs(low_from_prev)
+
+    if stop_broken_now:
+        state = "跌破硬防守"
+    elif stop_touched:
+        state = "触及硬防守后收回" if current_price is not None and stop_price is not None and current_price > stop_price else "触及硬防守"
+    elif recovered_watch:
+        state = f"{severity}后站回{watch_text}"
+    else:
+        state = f"{severity}后未站回{watch_text}"
+
+    event_stats = (profile.get("event_stats") or {}).get(event_bucket) or {}
+    state_key = "recovered" if recovered_watch else "unrecovered"
+    state_label = "站回关键线" if recovered_watch else "未站回关键线"
+    state_stats = event_stats.get(state_key) or {}
+    recovered_stats = event_stats.get("recovered") or {}
+    unrecovered_stats = event_stats.get("unrecovered") or {}
+    evaluated_count = int(_number(event_stats.get("evaluated_count")) or 0)
+    state_count = int(_number(state_stats.get("count")) or 0)
+    has_history_support = bool(event_stats.get("has_support") and state_count >= ADAPTIVE_DROP_MIN_GROUP_ROWS)
+    avg_return = _number(state_stats.get("avg_return"))
+    win_rate = _number(state_stats.get("win_rate"))
+    recovered_avg = _number(recovered_stats.get("avg_return"))
+    unrecovered_avg = _number(unrecovered_stats.get("avg_return"))
+    recovery_has_edge = bool(
+        recovered_avg is not None
+        and unrecovered_avg is not None
+        and recovered_avg > unrecovered_avg
+    )
+    risk_backed = bool(
+        has_history_support
+        and (
+            (avg_return is not None and avg_return <= 0)
+            or (win_rate is not None and win_rate < 50)
+        )
+    )
+    repair_backed = bool(
+        has_history_support
+        and recovered_watch
+        and (avg_return is not None and avg_return > 0)
+        and (win_rate is None or win_rate >= 50)
+    )
+
+    if has_history_support:
+        history_support_text = (
+            f"回测支撑: 同类样本{evaluated_count}次，{state_label}样本{state_count}次，"
+            f"5日均值{_as_text(_round(avg_return, 2), '%')}，胜率{_as_text(_round(win_rate, 2), '%')}。"
+        )
+    else:
+        history_support_text = (
+            f"回测支撑不足: 同类样本{evaluated_count}次，{state_label}样本{state_count}次，"
+            "动作降级为观察和价格线纪律。"
+        )
+
+    break_word = "跌破这一区域后" if len(watch_levels) > 1 else "跌破后"
+    stand_word = "重新站稳这一区域" if len(watch_levels) > 1 else f"重新站稳{watch_text}"
+    if not has_trade_context:
+        if not has_history_support:
+            if recovered_watch:
+                action = f"已站回{watch_text}，但同类样本不足；没有系统推荐前不开新仓。"
+            else:
+                action = f"{watch_text}只作观察线；没有系统推荐前不开新仓。"
+        elif not recovered_watch:
+            if risk_backed:
+                action = f"同类未修复样本偏弱，无仓不买；有仓按自己的成本线降风险。"
+            else:
+                action = f"收盘仍没站回{watch_text}，无仓不买；有仓只按自己的成本线处理。"
+        else:
+            action = f"已站回{watch_text}，但没有系统推荐前不当作买点。"
+    elif stop_broken_now:
+        action = f"已经跌破{_format_named_level('有效防守', stop_price)}，先降风险；反弹不能收回不等。"
+    elif not has_history_support:
+        if recovered_watch:
+            action = f"同类样本不足，动作不升级；后续只看{watch_text}和原防守，跌回关键线不加仓。"
+        else:
+            action = f"同类样本不足，动作不升级；只看{watch_text}和原防守，未站回不加仓。"
+    elif not recovered_watch:
+        if risk_backed:
+            action = f"同类未修复样本偏弱，反弹不能站回{watch_text}，先降风险。"
+        else:
+            action = f"先看能否{stand_word}；回测没有给出强风险级别前，不加仓。"
+    elif repair_backed and recovery_has_edge:
+        action = f"下一交易日重点看{watch_text}；{break_word}收不回先减仓。"
+    else:
+        action = f"已站回{watch_text}，但同类修复优势不强；不加仓，跌回关键线先减仓。"
+
+    return {
+        "severity": severity,
+        "state": state,
+        "event_bucket": event_bucket,
+        "drop_percentile": _round(drop_percentile, 2),
+        "drop_rank_text": (
+            f"低点回撤处在该股历史{_round(drop_percentile, 2)}分位"
+            if drop_percentile is not None
+            else None
+        ),
+        "low_change_pct": _round(low_from_prev, 2),
+        "current_change_pct": _round(current_change, 2),
+        "current_label": _quote_current_label(quote),
+        "recovery_points": _round(recovery_points, 2),
+        "recovery_ratio_pct": _round(recovery_ratio * 100, 2) if recovery_ratio is not None else None,
+        "stop_price": _round(stop_price, 2),
+        "stop_touched": stop_touched,
+        "stop_broken_now": stop_broken_now,
+        "has_trade_context": has_trade_context,
+        "watch_levels": [{k: v for k, v in item.items() if k != "key"} for item in watch_levels],
+        "watch_text": watch_text,
+        "recovered_watch": recovered_watch,
+        "history_support": has_history_support,
+        "history_support_text": history_support_text,
+        "history_event_stats": {
+            "bucket": event_bucket,
+            "evaluated_count": evaluated_count,
+            "state": state_key,
+            "state_count": state_count,
+            "state_avg_return_5d": _round(avg_return, 2),
+            "state_win_rate_5d": _round(win_rate, 2),
+            "recovered_avg_return_5d": _round(recovered_avg, 2),
+            "unrecovered_avg_return_5d": _round(unrecovered_avg, 2),
+        },
+        "action": action,
+        "minute_data_note": "没有分钟线，不判断收回耗时，只按价格线判断修复是否有效。",
+    }
+
+
+def _format_realtime_unavailable(realtime):
+    if not realtime:
+        return None
+
+    source = realtime.get("source") or "unknown"
+    reason = realtime.get("reason") or "realtime_unavailable"
+    consistency = realtime.get("data_consistency") or {}
+    if consistency:
+        return (
+            f"{source}/{reason}，实时昨收{_as_text(consistency.get('realtime_prev_close'))} "
+            f"vs 本地收盘{_as_text(consistency.get('local_close'))}，"
+            f"偏差{_as_text(consistency.get('prev_close_delta_pct'), '%')}"
+        )
+    return f"{source}/{reason}"
 
 
 def _first_non_empty(*values):
@@ -3963,6 +4365,78 @@ def _brief_join(items, limit=3):
     return "；".join(values[:limit]) + f"；另{len(values) - limit}项"
 
 
+def _compact_level_text(items, limit=2):
+    values = []
+    for item in items or []:
+        if isinstance(item, dict):
+            name = item.get("name")
+            price = item.get("price")
+            text = f"{name} {_as_text(price)}" if name else _as_text(price)
+        else:
+            text = str(item)
+        if text:
+            values.append(text)
+    return "、".join(values[:limit]) if values else "--"
+
+
+def _first_level_text(items):
+    return _compact_level_text(items, limit=1)
+
+
+def _execution_headline(result, realtime, operation, model):
+    if not realtime.get("success"):
+        return operation.get("decision") or "--"
+
+    mode = realtime.get("mode")
+    decision = realtime.get("decision") or operation.get("decision") or "--"
+    tier = model.get("recommendation_tier")
+    if mode == "holding_management":
+        return "不是新买点；有仓按防守线管，无仓不接。"
+    if mode == "entry_acceptance_check":
+        if "通过" in decision:
+            return "承接暂通过；只按原计划分批，不追高。"
+        return "承接没通过；无仓先不买，有仓守防守。"
+    if tier == adaptive.RECOMMENDATION_TIER_FORMAL:
+        return "可执行候选；只等回踩承接，不追高。"
+    if tier == adaptive.RECOMMENDATION_TIER_OBSERVE:
+        return "观察候选；不是正式买点，只能小仓验证。"
+    return "不是买点；只观察，不主动开仓。"
+
+
+def _build_intraday_drop_rule(realtime, levels):
+    drop_view = (realtime or {}).get("intraday_drop_view") or _build_intraday_drop_view(realtime, levels)
+    if not drop_view:
+        return None
+
+    low_text = _as_text(drop_view.get("low_change_pct"), "%")
+    current_text = _as_text(drop_view.get("current_change_pct"), "%")
+    stop_text = _as_text(drop_view.get("stop_price"))
+
+    base = (
+        f"盘中最低跌到{low_text}，{drop_view.get('current_label') or '当前'}"
+        f"收回到{current_text}，属于{drop_view.get('state')}。"
+    )
+    if drop_view.get("drop_rank_text"):
+        base += f"{drop_view.get('drop_rank_text')}。"
+    if drop_view.get("stop_price") is not None:
+        if drop_view.get("stop_broken_now"):
+            base += f"当前已跌破防守{stop_text}。"
+        elif drop_view.get("stop_touched"):
+            base += f"盘中碰过防守{stop_text}。"
+        else:
+            base += f"没有打到硬防守{stop_text}。"
+
+    final_risk = ""
+    if drop_view.get("stop_price") is not None and not drop_view.get("stop_broken_now"):
+        final_risk = f"若跌破防守{stop_text}或收盘仍在关键线下，退出/大幅降仓。"
+
+    return (
+        f"{base}{drop_view.get('action') or ''}"
+        f"{drop_view.get('history_support_text') or ''}"
+        f"{drop_view.get('minute_data_note') or ''}{final_risk}"
+    )
+
+
 def _print_execution_report(result):
     if not result.get("success"):
         print(result.get("message") or result.get("reason") or "分析失败")
@@ -3979,17 +4453,18 @@ def _print_execution_report(result):
     structure = realtime.get("structure_view") or {}
     day_tape = realtime.get("day_tape") or {}
     levels = realtime.get("key_levels") or {}
+    execution_context = realtime.get("execution_context") or {}
+    has_trade_context = bool(execution_context.get("has_trade_context") or levels.get("has_trade_context"))
     holding_metrics = realtime.get("holding_metrics") or {}
     memory_summary = ((result.get("strategy_memory_review") or {}).get("summary") or {})
     evidence_grade = professional_view.get("evidence_grade")
-    ai_answer = result.get("ai_direct_answer") or {}
 
     title_bits = [result.get("stock_code"), result.get("stock_name")]
     print(f"个股执行版: {' '.join(str(bit) for bit in title_bits if bit)}")
     if realtime.get("success"):
         print(
-            f"时间: {quote.get('quote_datetime') or '--'} | "
-            f"现价: {_as_text(quote.get('current'))} ({_as_text(quote.get('change_pct'), '%')}) | "
+            f"实时: {quote.get('quote_datetime') or '--'} | "
+            f"{_as_text(quote.get('current'))} ({_as_text(quote.get('change_pct'), '%')}) | "
             f"市场: {realtime.get('market_summary') or '--'}"
         )
     else:
@@ -3997,18 +4472,11 @@ def _print_execution_report(result):
             f"交易日: {result.get('latest_trade_date') or '--'} | "
             f"市场: {market.get('market_env') or '--'}({_as_text(market.get('market_change_5d'), '%')}, 广度{_as_text(market.get('market_breadth_5d'), '%')})"
         )
+        realtime_unavailable = _format_realtime_unavailable(realtime)
+        if realtime_unavailable:
+            print(f"实时: 不可用 | {realtime_unavailable}")
 
     print()
-    print("结论")
-    if ai_answer.get("success"):
-        print(ai_answer.get("answer") or "--")
-    elif realtime.get("success"):
-        print(f"{realtime.get('decision') or operation.get('decision') or '--'}。{structure.get('summary') or ''}")
-    else:
-        print(f"{operation.get('decision') or '--'}。{model.get('recommendation_tier_reason') or ''}")
-
-    print()
-    print("动作")
     no_position_action = _first_non_empty(
         realtime.get("no_position_action"),
         operation.get("new_position"),
@@ -4017,74 +4485,121 @@ def _print_execution_report(result):
         realtime.get("holding_action"),
         operation.get("holding_position"),
     )
-    print(f"- 无仓: {no_position_action or '--'}")
-    print(f"- 持仓: {holding_action or '--'}")
-    if realtime.get("warnings"):
-        print(f"- 提醒: {_brief_join(realtime.get('warnings'), limit=3)}")
-
-    print()
-    print("关键价位")
+    stop_price = None
+    support_text = "--"
+    pressure_text = "--"
+    strongest_pressure = "--"
     if realtime.get("success"):
-        print(
-            f"- 盘口: 开{_as_text(quote.get('open'))} / 高{_as_text(quote.get('high'))} / "
-            f"低{_as_text(quote.get('low'))} / 现{_as_text(quote.get('current'))}"
-        )
-        print(f"- 支撑/观察: {structure.get('support_text') or _join_level_text(structure.get('supports') or [])}")
-        print(f"- 压力/修复: {structure.get('pressure_text') or _join_level_text(structure.get('pressures') or [])}")
-        if holding_metrics.get("entry_price") is not None:
-            print(
-                f"- 持仓线: 入场{holding_metrics.get('entry_price')}，"
-                f"收益{_as_text(holding_metrics.get('current_return_pct'), '%')}，"
-                f"有效防守{_as_text(levels.get('effective_stop'))}，"
-                f"距防守{_as_text(holding_metrics.get('distance_to_stop_pct'), '%')}"
-            )
-        else:
-            print("- 持仓线: 无系统入场记录，不把盘中表现当新仓买点。")
+        stop_price = levels.get("effective_stop") if has_trade_context else None
+        support_text = _compact_level_text(structure.get("supports") or [], limit=2)
+        pressure_text = _compact_level_text(structure.get("pressures") or [], limit=2)
+        strongest_pressure = _first_level_text(structure.get("pressures") or [])
     else:
         buy_entry = result.get("buy_entry_strategy") or {}
         buy_zone = buy_entry.get("suggested_buy_zone") or {}
-        print(f"- 防守: {_as_text(trade_plan.get('stop_price'))}")
-        print(f"- 观察区: {((buy_zone.get('watch_zone') or {}).get('text')) or '--'}")
-        print(f"- 压力: {_as_text(buy_zone.get('pressure_price'))}")
-        print(f"- 不追高: {_as_text(buy_zone.get('no_chase_price'))}")
+        stop_price = trade_plan.get("stop_price")
+        support_text = ((buy_zone.get("watch_zone") or {}).get("text")) or "--"
+        strongest_pressure = _as_text(buy_zone.get("pressure_price"))
+        pressure_text = strongest_pressure
+
+    print("结论:")
+    print(_execution_headline(result, realtime, operation, model))
 
     print()
-    print("依据")
-    print(
-        f"- 系统: {model.get('recommendation_tier') or '--'} | "
-        f"评级{scorecard.get('rating') or '--'}({_as_text(scorecard.get('score'), '分')}) | "
-        f"证据{evidence_grade or '--'} | 行业{professional_view.get('industry_grade') or '--'}"
-    )
-    if memory_summary.get("latest_formal_date"):
-        print(
-            f"- 历史推荐: 最近正式推荐{memory_summary.get('latest_formal_date')}，"
-            f"{memory_summary.get('personal_guidance') or '--'}"
-        )
-    else:
-        print("- 历史推荐: 没有正式落库推荐。")
+    print("现在怎么做:")
+    print(f"- 无仓: {no_position_action or '--'}")
+    print(f"- 持仓: {holding_action or '--'}")
+    drop_rule = _build_intraday_drop_rule(realtime, levels)
+    if drop_rule:
+        print(f"- 急跌规则: {drop_rule}")
+    if has_trade_context and stop_price is not None:
+        print(f"- 错了就走: 跌破或不能收回 {_as_text(stop_price)}，先降风险。")
+    if strongest_pressure != "--":
+        print(f"- 重新评估: 先收复 {strongest_pressure}，并重新满足系统推荐/承接。")
+
+    print()
+    print("关键线:")
     if realtime.get("success"):
+        if has_trade_context:
+            print(
+                f"- 现价 {_as_text(quote.get('current'))}；防守 {_as_text(stop_price)}；"
+                f"支撑 {support_text}；压力 {pressure_text}"
+            )
+        else:
+            print(
+                f"- 现价 {_as_text(quote.get('current'))}；观察 {support_text}；压力 {pressure_text}"
+            )
+        if holding_metrics.get("entry_price") is not None:
+            print(
+                f"- 入场 {_as_text(holding_metrics.get('entry_price'))}；当前收益 {_as_text(holding_metrics.get('current_return_pct'), '%')}；"
+                f"距防守 {_as_text(holding_metrics.get('distance_to_stop_pct'), '%')}"
+            )
+    else:
+        print(f"- 防守 {_as_text(stop_price)}；观察区 {support_text}；压力 {pressure_text}")
+
+    print()
+    print("为什么:")
+    latest_formal = memory_summary.get("latest_formal_date")
+    system_bits = [f"系统{model.get('recommendation_tier') or '--'}"]
+    if scorecard.get("rating"):
+        system_bits.append(f"评级{scorecard.get('rating')}")
+    if evidence_grade:
+        system_bits.append(f"证据{evidence_grade}")
+    if latest_formal:
+        system_bits.append(f"最近正式推荐{latest_formal}")
+    print("- " + "，".join(system_bits) + "。")
+    score_text = _scorecard_component_text(scorecard)
+    if score_text:
         print(
-            f"- 盘中: {day_tape.get('grade') or '--'}，"
-            f"开盘缺口{_as_text(day_tape.get('open_gap_pct'), '%')}，"
-            f"当前位置{_as_text(day_tape.get('current_position_pct'), '%')}"
+            f"- 评分构成: {score_text}；"
+            f"合计{_as_text(scorecard.get('score'), '分')} -> {scorecard.get('rating') or '--'}。"
         )
-        if structure.get("observations"):
-            print(f"- 结构: {_brief_join(structure.get('observations'), limit=3)}")
+    if realtime.get("success"):
+        tape_grade = day_tape.get("grade") or "--"
+        if isinstance(tape_grade, str) and tape_grade.startswith("盘中"):
+            tape_grade = tape_grade[2:]
+        open_gap_text = _as_text(day_tape.get("open_gap_pct"), "%")
+        drop_view = realtime.get("intraday_drop_view") or {}
+        drop_not_repaired = bool(drop_view and not drop_view.get("recovered_watch"))
+        if not has_trade_context and ("偏弱" in str(tape_grade) or drop_not_repaired):
+            print(
+                f"- 盘中{tape_grade}，开盘缺口{open_gap_text}；没有系统推荐，且没有形成有效修复。"
+            )
+        elif not has_trade_context:
+            print(
+                f"- 盘中{tape_grade}，开盘缺口{open_gap_text}；只能作为观察，不能升级成新买点。"
+            )
+        else:
+            print(
+                f"- 盘中{tape_grade}，但开盘缺口{open_gap_text}，"
+                f"只能说明承接修复，不能升级成新买点。"
+            )
+    if realtime.get("warnings"):
+        print(f"- 提醒: {_brief_join(realtime.get('warnings'), limit=2)}")
     fail_reasons = model.get("quality_fail_reasons") or []
-    if fail_reasons:
-        print(f"- 未通过: {_brief_join(fail_reasons, limit=3)}")
     if model.get("risk_labels"):
         print(f"- 风险: {model.get('risk_labels')}")
+    elif fail_reasons:
+        print(f"- 未通过: {_brief_join(fail_reasons, limit=2)}")
 
     print()
     print("更多细节: 加 --detail；机器读取: 加 --json")
 
 
 def _print_report(result, detail=False):
-    if detail:
-        _print_detail_report(result)
-    else:
-        _print_execution_report(result)
+    text = _render_report_text(result, detail=detail)
+    if text:
+        print(text)
+
+
+def _render_report_text(result, detail=False):
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        if detail:
+            _print_detail_report(result)
+        else:
+            _print_execution_report(result)
+    return output.getvalue().rstrip()
 
 
 def _print_detail_report(result):
@@ -4112,7 +4627,6 @@ def _print_detail_report(result):
     scenarios = result.get("execution_scenarios") or {}
     buy_entry = result.get("buy_entry_strategy") or {}
     realtime_execution = result.get("realtime_execution") or {}
-    ai_direct_answer = result.get("ai_direct_answer") or {}
     overlay = result.get("risk_overlay") or {}
 
     print(f"个股分析: {result['stock_code']} {result.get('stock_name') or ''}")
@@ -4233,10 +4747,24 @@ def _print_detail_report(result):
         if realtime_execution.get("warnings"):
             print(f"- 实时提醒: {'；'.join(realtime_execution.get('warnings') or [])}")
         print(f"- 纪律说明: {realtime_execution.get('discipline_note') or '--'}")
-        if ai_direct_answer.get("success"):
-            print()
-            print("直接回答:")
-            print(ai_direct_answer.get("answer") or "--")
+    elif realtime_execution.get("enabled"):
+        consistency = realtime_execution.get("data_consistency") or {}
+        print()
+        print("实时盘中:")
+        print(
+            f"- 不可用: {_format_realtime_unavailable(realtime_execution) or '--'}"
+        )
+        print(
+            f"- 数据源: {realtime_execution.get('source') or '--'} | "
+            f"URL: {realtime_execution.get('url') or '--'}"
+        )
+        if consistency:
+            print(
+                f"- 口径校验: 实时昨收{_as_text(consistency.get('realtime_prev_close'))} "
+                f"vs 本地收盘{_as_text(consistency.get('local_close'))}，"
+                f"偏差{_as_text(consistency.get('prev_close_delta_pct'), '%')}，"
+                f"容忍{_as_text(consistency.get('tolerance_pct'), '%')}"
+            )
     if attack_defense:
         technical_lines = attack_defense.get("technical") or {}
         professional_lines = attack_defense.get("professional") or {}
@@ -4409,7 +4937,7 @@ def _print_detail_report(result):
     if model.get("quality_fail_reasons"):
         print(f"- 未通过项: {'；'.join(model.get('quality_fail_reasons') or [])}")
     print(f"- 风险: {model.get('risk_labels') or '--'} | 放弃条件: {model.get('no_buy_condition') or '--'}")
-    print(f"- 评分构成: {'；'.join(scorecard.get('details') or []) or '--'}")
+    print(f"- 评分构成: {_scorecard_component_text(scorecard) or '--'}")
     print()
     print("行业共振:")
     print(f"- {industry_view.get('summary') or '--'}")
