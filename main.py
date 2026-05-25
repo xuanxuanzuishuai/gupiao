@@ -145,23 +145,23 @@ if __name__ == "__main__":
         include_backtest=False,
         persist_strategy_result=True,
     )
-    long_runway_summary = run_stage(
-        f"每日{LONG_RUNWAY_MODEL_DISPLAY}中长期跟踪",
-        analysis_gu_piao_history_long_runway_model,
-        end_date=target_trade_date,
-        top_candidate_count=10,
-    )
-    print_long_runway_summary(long_runway_summary)
-    long_runway_save_result = persist_long_runway_candidates_to_strategy_result(
-        long_runway_summary,
-        trade_date=target_trade_date,
-    )
-    print(
-        f"{LONG_RUNWAY_MODEL_DISPLAY}策略结果表: "
-        f"success={long_runway_save_result.get('success')}, "
-        f"trade_date={long_runway_save_result.get('trade_date')}, "
-        f"saved_count={long_runway_save_result.get('saved_count')}, "
-        f"strategy_type={long_runway_save_result.get('strategy_type')}, "
-        "tier=中长期跟踪",
-        flush=True,
-    )
+    # long_runway_summary = run_stage(
+    #     f"每日{LONG_RUNWAY_MODEL_DISPLAY}中长期跟踪",
+    #     analysis_gu_piao_history_long_runway_model,
+    #     end_date=target_trade_date,
+    #     top_candidate_count=10,
+    # )
+    # print_long_runway_summary(long_runway_summary)
+    # long_runway_save_result = persist_long_runway_candidates_to_strategy_result(
+    #     long_runway_summary,
+    #     trade_date=target_trade_date,
+    # )
+    # print(
+    #     f"{LONG_RUNWAY_MODEL_DISPLAY}策略结果表: "
+    #     f"success={long_runway_save_result.get('success')}, "
+    #     f"trade_date={long_runway_save_result.get('trade_date')}, "
+    #     f"saved_count={long_runway_save_result.get('saved_count')}, "
+    #     f"strategy_type={long_runway_save_result.get('strategy_type')}, "
+    #     "tier=中长期跟踪",
+    #     flush=True,
+    # )
