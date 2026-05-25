@@ -11,7 +11,7 @@ import time
 
 import pandas as pd
 
-import strategies.adaptive_strategy as adaptive
+import analysis_gu_piao_history_adaptive_model as adaptive
 import analysis_gu_piao_risk_overlay as risk_overlay
 
 

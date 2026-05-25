@@ -1,16 +1,14 @@
 import get_gu_piao_info
 import analysis_gu_piao_risk_overlay as risk_overlay
 from analysis_gu_piao_data_print_result import analysis_gu_piao_data, clear_daily_strategy_results
-from strategies.adaptive_strategy import (
-    SHORT_TERM_MODEL_DISPLAY,
-    clear_adaptive_strategy_results,
-    run_adaptive_model_workflow,
-)
-from strategies.long_runway_strategy import (
+from analysis_gu_piao_history_adaptive_model import (
     LONG_RUNWAY_MODEL_DISPLAY,
+    SHORT_TERM_MODEL_DISPLAY,
     analysis_gu_piao_history_long_runway_model,
+    clear_adaptive_strategy_results,
     clear_long_runway_strategy_results,
     persist_long_runway_candidates_to_strategy_result,
+    run_adaptive_model_workflow,
 )
 
 
