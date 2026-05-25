@@ -1,0 +1,19 @@
+# mac
+.DS_Store
+
+# pycharm
+.idea/
+
+# env
+.env
+
+# logs
+log/
+*.log
+
+# cache
+cache/
+
+# python
+__pycache__/
+*.pyc
