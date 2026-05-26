@@ -68,6 +68,7 @@ SPECIAL_POOL_LABELS = {
     "high_volatility": "高波动票",
     "overheated": "短线过热票",
 }
+EXTERNAL_FORCE_DOWNGRADE_LABELS = {"减持", "大比例解禁", "近端超大比例解禁"}
 
 
 def _normalize_stock_code(value):
@@ -1094,7 +1095,8 @@ def _merge_external_context(row, external_context):
     block_formal = _normalize_bool(row.get("risk_overlay_block_formal")) or _normalize_bool(
         external_context.get("block_formal")
     )
-    downgrade = _normalize_bool(row.get("risk_overlay_downgrade")) or external_score >= 3
+    force_downgrade = any(label in EXTERNAL_FORCE_DOWNGRADE_LABELS for label in labels)
+    downgrade = _normalize_bool(row.get("risk_overlay_downgrade")) or external_score >= 3 or force_downgrade
     total_score = min(base_score + external_score, 40.0)
     row["risk_overlay_score"] = _round_or_none(total_score, 2)
     row["risk_overlay_level"] = "高" if block_formal or total_score >= 8 else "中" if downgrade or total_score >= 4 else "低"
@@ -1104,7 +1106,7 @@ def _merge_external_context(row, external_context):
     if block_formal:
         row["risk_overlay_action"] = "不进入普通正式推荐，单独放入特殊股票池观察承接"
     elif downgrade:
-        row["risk_overlay_action"] = "不作为加分项，正式推荐需提示事件供给压力并等待承接确认"
+        row["risk_overlay_action"] = "不进入普通正式推荐，降级观察并等待事件供给压力释放"
     else:
         row["risk_overlay_action"] = row.get("risk_overlay_action") or "可按普通策略继续评估"
     row["fundamental_event_context"] = external_context

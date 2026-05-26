@@ -3890,6 +3890,7 @@ def _backtest_horizon_profiles(history, top_candidate_count=TOP_CANDIDATE_COUNT,
             trade_date=eval_date_text,
             overlay_frame=overlay_frame,
             filter_blocked=True,
+            filter_downgraded=True,
         )
         if scored.empty:
             continue
@@ -4421,11 +4422,13 @@ def persist_adaptive_candidates_to_strategy_result(
                     f"{row.get('stock_code')} {row.get('stock_name')} labels={row.get('risk_overlay_labels')}"
                     for _, row in final_frame[downgrade_mask].head(5).iterrows()
                 )
-                _emit_runtime_status(f"{SHORT_TERM_MODEL_DISPLAY}落库事件降级提示: {downgrade_text}")
+                _emit_runtime_status(f"{SHORT_TERM_MODEL_DISPLAY}落库事件降级剔除: {downgrade_text}")
 
-            final_frame = final_frame[~block_mask].copy()
+            final_frame = final_frame[~block_mask & ~downgrade_mask].copy()
             if final_frame.empty and block_mask.any():
                 final_filter_reason = "candidate_empty_after_final_hard_block"
+            elif final_frame.empty and downgrade_mask.any():
+                final_filter_reason = "candidate_empty_after_final_downgrade"
             if "risk_adjusted_score" in final_frame.columns:
                 before_score_gate_count = int(len(final_frame))
                 final_frame = final_frame[
@@ -4780,7 +4783,7 @@ def analysis_gu_piao_history_adaptive_model(
         overlay_frame=overlay_frame,
         include_external=True,
         filter_blocked=True,
-        filter_downgraded=False,
+        filter_downgraded=True,
         score_penalty_multiplier=EXTERNAL_RISK_SCORE_PENALTY_MULTIPLIER,
     )
     if candidate_df.empty:
@@ -5592,6 +5595,8 @@ def run_adaptive_model_workflow(
             f"mode={adaptive_health.get('mode')}, mode_label={adaptive_health.get('mode_label')}, "
             f"confidence_weight={adaptive_health.get('confidence_weight')}, "
             f"max_pick_ratio={adaptive_health.get('max_pick_ratio')}, "
+            f"signal_health_available={adaptive_health.get('signal_health_available')}, "
+            f"ignored_signal_reasons={adaptive_health.get('ignored_signal_failure_reasons')}, "
             f"reasons={adaptive_health.get('failure_reasons')}"
         )
 
