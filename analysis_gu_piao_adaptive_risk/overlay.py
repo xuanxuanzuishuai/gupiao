@@ -1,3 +1,17 @@
+"""自适应风险覆盖层。
+
+作用:
+    把特殊股票池、市场状态、事件信息和外部上下文转换为统一风险字段，
+    例如风险分、风险标签、硬拦截、降级观察和处理建议。它是各类
+    选股策略进入正式推荐或落库前的通用风控入口。
+
+流程:
+    先读取近期历史并识别普通股票池、次新、连板、高波动、过热等分支；
+    再合并 adaptive_model 生成的动态规则和外部事件上下文；
+    最后对候选 DataFrame 追加 risk_overlay_* 字段，或刷新落库
+    a_stock_risk_overlay 供其他策略复用。
+"""
+
 import argparse
 import json
 import math
@@ -1441,7 +1455,7 @@ def _run_adaptive_risk_overlay_model(
     adaptive_report_path=None,
 ):
     try:
-        import analysis_gu_piao_adaptive_risk_overlay_model as adaptive_model
+        from . import adaptive_model
     except Exception as error:
         func.logInfo(f"{DEFAULT_ADAPTIVE_RISK_MODEL_DISPLAY}加载失败: {error}")
         return {"success": False, "reason": f"import_failed:{error}"}

@@ -1,3 +1,17 @@
+"""A股股票代码、名称和行业基础资料抓取。
+
+作用:
+    从 akshare 多个数据源抓取 A 股代码、股票名称、行业/板块信息，并
+    做字段兼容、去重和兜底合并，为后续行情抓取和策略分析提供基础
+    股票池。
+
+流程:
+    先按候选数据源依次请求代码名称和行业板块数据；
+    再标准化代码、名称和行业字段，并合并多源结果；
+    然后过滤异常记录、补齐缺失信息；
+    最后把基础股票池写入本地数据库，供 get_gu_piao_info 使用。
+"""
+
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed

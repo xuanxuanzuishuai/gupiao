@@ -1,3 +1,17 @@
+"""每日固定策略分析与结果打印。
+
+作用:
+    运行传统/固定规则类股票策略，生成每日候选、回测统计、风险覆盖
+    摘要和可打印结果。它与自适应模型并列存在，主要承接非自适应的
+    日常策略逻辑，并提供清理每日策略结果的公共入口。
+
+流程:
+    先读取最新行情和历史样本，组装各类固定策略候选；
+    再调用自适应风险覆盖入口为候选追加 risk_overlay_* 字段；
+    然后生成策略说明、市场摘要和历史验证指标；
+    最后按调用参数打印结果或写入 a_stock_strategy_result。
+"""
+
 import math
 from datetime import datetime
 
@@ -5,7 +19,7 @@ import pandas as pd
 import pymysql
 
 import func
-import analysis_gu_piao_risk_overlay as risk_overlay
+import analysis_gu_piao_adaptive_risk_overlay_model as risk_overlay
 
 
 def _emit_runtime_status(message):

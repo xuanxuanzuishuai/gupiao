@@ -1,5 +1,19 @@
+"""每日股票分析主流程。
+
+作用:
+    串联数据抓取、风险覆盖刷新、固定策略推荐和自适应策略推荐，是
+    每日自动运行时最外层的编排入口。它只负责阶段顺序、前置校验和
+    失败时清理结果，不直接实现具体策略算法。
+
+流程:
+    先运行 get_gu_piao_info 抓取行情并确认目标交易日；
+    再刷新自适应风险覆盖表，确保策略使用最新风控结果；
+    然后运行每日固定策略推荐；
+    最后运行短线自适应模型工作流并按健康验证结果决定是否落库。
+"""
+
 import get_gu_piao_info
-import analysis_gu_piao_risk_overlay as risk_overlay
+import analysis_gu_piao_adaptive_risk_overlay_model as risk_overlay
 from analysis_gu_piao_data_print_result import analysis_gu_piao_data, clear_daily_strategy_results
 from analysis_gu_piao_history_adaptive_model import (
     LONG_RUNWAY_MODEL_DISPLAY,

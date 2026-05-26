@@ -1,3 +1,17 @@
+"""A股行情抓取与历史入库。
+
+作用:
+    抓取最新 A 股行情和必要的历史窗口，计算均线、涨跌幅、量比、
+    振幅、换手、阶段高低点等策略特征，并维护 a_stock_analysis 与
+    a_stock_analysis_history。它是每日推荐流程的数据入口。
+
+流程:
+    先读取基础股票池并并发请求腾讯、东方财富、Sina 等行情源；
+    再对行情做重试、兜底、交易日一致性和字段规范化；
+    然后计算策略所需的滚动指标和最新快照标记；
+    最后写入当前分析表和历史表，并返回本次目标交易日与入库统计。
+"""
+
 from collections import Counter
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta

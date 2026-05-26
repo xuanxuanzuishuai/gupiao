@@ -1,3 +1,19 @@
+"""单只股票综合分析入口。
+
+作用:
+    面向指定股票代码输出更细的单票诊断，把实时行情、历史位置、
+    自适应短线画像、长跑跟踪、风险覆盖、持仓建议和解释文本整合到
+    一份结构化结果里。它适合人工查看某一只股票为什么能买、该不该买、
+    或为什么需要回避。
+
+流程:
+    先确定分析日期并加载目标股票近期历史窗口；
+    再复用自适应模型构建画像和评分，同时补充单票下跌修复、持仓完整性
+    等专项诊断；
+    然后调用自适应风险覆盖入口叠加特殊池和事件风险；
+    最后汇总为控制台输出或 JSON 结果，供人工复盘和决策参考。
+"""
+
 import argparse
 import contextlib
 import datetime as dt
@@ -11,7 +27,7 @@ import time
 import pandas as pd
 
 import analysis_gu_piao_history_adaptive_model as adaptive
-import analysis_gu_piao_risk_overlay as risk_overlay
+import analysis_gu_piao_adaptive_risk_overlay_model as risk_overlay
 
 
 HOLDING_INTACT_TREND_STATES = {"周月同步抬升", "月线抬升，周线整理", "月线抬升，周线回踩"}
