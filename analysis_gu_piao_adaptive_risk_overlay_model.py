@@ -417,10 +417,14 @@ def _add_overlay_features(frame):
     if frame.empty:
         return frame
 
-    code = frame["stock_code"].fillna("")
-    frame["board_limit_pct"] = 10.0
-    frame.loc[code.str.startswith(("300", "301", "688", "689")), "board_limit_pct"] = 20.0
-    frame.loc[code.str.startswith(("8", "4", "9")), "board_limit_pct"] = 30.0
+    frame["board_limit_pct"] = frame.apply(
+        lambda row: risk_overlay._board_limit_pct(
+            row.get("stock_code"),
+            stock_name=row.get("stock_name"),
+            trade_date=row.get("last_data_date"),
+        ),
+        axis=1,
+    )
 
     frame["listing_trade_days"] = frame.groupby("stock_code", sort=False).cumcount() + 1
     global_first_trade_date = frame["last_data_date"].min()
@@ -607,8 +611,8 @@ def _calibrate_action_and_score(default_rule, evidence_level):
 
     if evidence_level == "insufficient":
         if base_action == "block":
-            return "downgrade", round(max(4.0, base_score * 0.65), 2), False
-        return "observe", 0.0, False
+            return "downgrade", round(max(4.0, base_score * 0.65), 2), True
+        return "observe", 0.0, True
 
     if evidence_level in {"strong_negative", "negative"}:
         return base_action, round(base_score, 2), True

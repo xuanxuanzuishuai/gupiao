@@ -30,6 +30,7 @@ DEFAULT_ADAPTIVE_RISK_MODEL_DISPLAY = "自适应风险覆盖模型"
 LATEST_ADAPTIVE_RISK_CONFIG = None
 DEFAULT_EVENT_LOOKBACK_DAYS = 45
 DEFAULT_UNLOCK_LOOKAHEAD_DAYS = 180
+MAIN_BOARD_ST_LIMIT_CHANGE_DATE = "2026-07-06"
 OVERLAY_HISTORY_COLUMNS = [
     "last_data_date",
     "stock_code",
@@ -69,6 +70,8 @@ SPECIAL_POOL_LABELS = {
     "overheated": "短线过热票",
 }
 EXTERNAL_FORCE_DOWNGRADE_LABELS = {"减持", "大比例解禁", "近端超大比例解禁"}
+BOOL_TRUE_TEXTS = {"1", "true", "t", "yes", "y", "on", "是", "真"}
+BOOL_FALSE_TEXTS = {"", "0", "false", "f", "no", "n", "off", "否", "假", "none", "null", "nan"}
 
 
 def _normalize_stock_code(value):
@@ -114,7 +117,25 @@ def _to_float(value):
 
 
 def _normalize_bool(value):
-    return bool(value) if value is not None and not pd.isna(value) else False
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in BOOL_FALSE_TEXTS:
+            return False
+        if text in BOOL_TRUE_TEXTS:
+            return True
+        return bool(text)
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
 
 
 def _query_frame(sql, params=None):
@@ -219,7 +240,32 @@ def build_market_regime_frame(history):
     return regime
 
 
-def _board_limit_pct(stock_code):
+def _is_st_stock_name(stock_name):
+    if stock_name is None or pd.isna(stock_name):
+        return False
+    text = str(stock_name).strip().upper().replace(" ", "")
+    return text.startswith(("ST", "*ST", "SST", "S*ST", "NST", "N*ST"))
+
+
+def _is_legacy_main_board_st_limit(stock_code, stock_name=None, trade_date=None):
+    if not _is_st_stock_name(stock_name):
+        return False
+
+    code = _normalize_stock_code(stock_code) or ""
+    if code.startswith(("300", "301", "688", "689", "8", "4", "9")):
+        return False
+
+    limit_change_ts = pd.Timestamp(MAIN_BOARD_ST_LIMIT_CHANGE_DATE)
+    trade_ts = pd.to_datetime(trade_date, errors="coerce")
+    if pd.isna(trade_ts):
+        trade_ts = pd.Timestamp.today().normalize()
+    return trade_ts.normalize() < limit_change_ts
+
+
+def _board_limit_pct(stock_code, stock_name=None, trade_date=None):
+    if _is_legacy_main_board_st_limit(stock_code, stock_name=stock_name, trade_date=trade_date):
+        return 5.0
+
     code = _normalize_stock_code(stock_code) or ""
     if code.startswith(("300", "301", "688", "689")):
         return 20.0
@@ -277,14 +323,15 @@ def _apply_adaptive_branch(
     if not condition:
         return None
     rule = _adaptive_rule(adaptive_config, rule_key, default_action, default_score)
-    if not rule.get("enabled"):
+    evidence_level = rule.get("evidence_level")
+    if not rule.get("enabled") and evidence_level != "insufficient":
         return {
             "score": 0.0,
             "block": False,
             "downgrade": False,
             "label": label,
             "pool": pool,
-            "adaptive_note": f"{label}:动态停用/{rule.get('evidence_level')}",
+            "adaptive_note": f"{label}:动态停用/{evidence_level}",
         }
     action = rule.get("action")
     return {
@@ -293,7 +340,7 @@ def _apply_adaptive_branch(
         "downgrade": action == "downgrade",
         "label": label,
         "pool": pool,
-        "adaptive_note": f"{label}:{rule.get('action_label')}/{rule.get('evidence_level')}",
+        "adaptive_note": f"{label}:{rule.get('action_label')}/{evidence_level}",
     }
 
 
@@ -305,7 +352,7 @@ def _resolve_row_overlay(row, adaptive_config=None):
     downgrade_to_observation = False
 
     listing_trade_days = _to_float(row.get("listing_trade_days")) or 0
-    probable_new_listing = bool(row.get("probable_new_listing"))
+    probable_new_listing = _normalize_bool(row.get("probable_new_listing"))
     limit_up_days_5d = _to_float(row.get("limit_up_days_5d")) or 0
     consecutive_limit_up_days = _to_float(row.get("consecutive_limit_up_days")) or 0
     today_change = _to_float(row.get("today_change")) or 0
@@ -481,7 +528,14 @@ def build_special_pool_overlay(history, trade_date=None, all_dates=False, adapti
     first_seen = frame.groupby("stock_code")["last_data_date"].transform("min")
     frame["first_seen_date"] = first_seen
     frame["probable_new_listing"] = first_seen > (global_first_trade_date + pd.Timedelta(days=7))
-    frame["board_limit_pct"] = frame["stock_code"].apply(_board_limit_pct)
+    frame["board_limit_pct"] = frame.apply(
+        lambda row: _board_limit_pct(
+            row.get("stock_code"),
+            stock_name=row.get("stock_name"),
+            trade_date=row.get("last_data_date"),
+        ),
+        axis=1,
+    )
     frame["is_limit_up"] = frame["today_change"] >= (frame["board_limit_pct"] - 0.4)
     frame["limit_up_days_5d"] = (
         frame.groupby("stock_code", sort=False)["is_limit_up"]
@@ -531,7 +585,7 @@ def build_special_pool_overlay(history, trade_date=None, all_dates=False, adapti
                 "stock_name": row.get("stock_name"),
                 "first_seen_date": _to_date_text(row.get("first_seen_date")),
                 "listing_trade_days": int(row.get("listing_trade_days") or 0),
-                "probable_new_listing": bool(row.get("probable_new_listing")),
+                "probable_new_listing": _normalize_bool(row.get("probable_new_listing")),
                 "board_limit_pct": _round_or_none(row.get("board_limit_pct"), 2),
                 "limit_up_days_5d": int(row.get("limit_up_days_5d") or 0),
                 "limit_up_days_10d": int(row.get("limit_up_days_10d") or 0),
@@ -1075,10 +1129,13 @@ def _overlay_for_candidates(candidate_df, history=None, trade_date=None, overlay
         return pd.DataFrame()
     overlay = overlay_frame.copy()
     overlay["stock_code"] = overlay["stock_code"].apply(_normalize_stock_code)
+    trade_date_text = _to_date_text(trade_date)
     if "trade_date" not in overlay.columns:
-        overlay["trade_date"] = trade_date
-    if trade_date:
-        overlay = overlay[overlay["trade_date"].astype(str) == str(trade_date)].copy()
+        overlay["trade_date"] = trade_date_text
+    else:
+        overlay["trade_date"] = overlay["trade_date"].apply(_to_date_text)
+    if trade_date_text:
+        overlay = overlay[overlay["trade_date"] == trade_date_text].copy()
     return overlay
 
 
@@ -1242,8 +1299,8 @@ def apply_risk_overlay_to_candidates(
         )
         candidates[score_column] = (candidates[original_column] - penalty).clip(lower=0)
 
-    candidates["risk_overlay_block_formal"] = candidates["risk_overlay_block_formal"].fillna(False).astype(bool)
-    candidates["risk_overlay_downgrade"] = candidates["risk_overlay_downgrade"].fillna(False).astype(bool)
+    candidates["risk_overlay_block_formal"] = candidates["risk_overlay_block_formal"].apply(_normalize_bool)
+    candidates["risk_overlay_downgrade"] = candidates["risk_overlay_downgrade"].apply(_normalize_bool)
 
     if filter_blocked:
         candidates = candidates[~candidates["risk_overlay_block_formal"]].copy()
@@ -1521,10 +1578,10 @@ def summarize_overlay(overlay_frame):
     frame = overlay_frame.copy()
     return {
         "total": int(len(frame)),
-        "blocked_formal": int(frame["risk_overlay_block_formal"].fillna(False).astype(bool).sum())
+        "blocked_formal": int(frame["risk_overlay_block_formal"].apply(_normalize_bool).sum())
         if "risk_overlay_block_formal" in frame.columns
         else 0,
-        "downgraded": int(frame["risk_overlay_downgrade"].fillna(False).astype(bool).sum())
+        "downgraded": int(frame["risk_overlay_downgrade"].apply(_normalize_bool).sum())
         if "risk_overlay_downgrade" in frame.columns
         else 0,
         "special_pool_counts": frame.get("special_pool_label", pd.Series(dtype=object)).fillna("未知").value_counts().to_dict(),

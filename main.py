@@ -114,6 +114,7 @@ def require_risk_overlay_ready(risk_overlay_summary, target_trade_date):
 
 if __name__ == "__main__":
     fetch_summary = run_stage("抓取个股行情与历史入库", get_gu_piao_info.get_gu_piao_info)
+
     target_trade_date = require_fetch_ready(fetch_summary)
     risk_overlay_summary = run_stage(
         "刷新风险覆盖表",
@@ -135,7 +136,9 @@ if __name__ == "__main__":
         f"report_path={adaptive_risk_model.get('report_path') or '--'}",
         flush=True,
     )
+
     run_stage("每日固定策略推荐", analysis_gu_piao_data, expected_trade_date=target_trade_date)
+
     run_stage(
         f"每日{SHORT_TERM_MODEL_DISPLAY}推荐",
         run_adaptive_model_workflow,

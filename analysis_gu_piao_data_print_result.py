@@ -934,7 +934,7 @@ def _apply_risk_overlay_to_strategy_frame(
         include_external=include_external,
         score_column="precision_score" if "precision_score" in strategy_df.columns else None,
         filter_blocked=True,
-        filter_downgraded=False,
+        filter_downgraded=True,
         score_penalty_multiplier=0.85,
     )
     if enriched.empty:
@@ -982,10 +982,16 @@ def _resolve_trade_date(snapshot_df):
     if trade_dates.empty:
         return str(datetime.now().date())
 
-    trade_day_counter = trade_dates.dt.date.value_counts()
-    max_count = trade_day_counter.max()
-    candidates = sorted(day for day, count in trade_day_counter.items() if count == max_count)
-    return str(candidates[-1])
+    return str(trade_dates.dt.date.max())
+
+
+def _filter_snapshot_by_trade_date(snapshot_df, trade_date):
+    if snapshot_df.empty or not trade_date or "last_data_date" not in snapshot_df.columns:
+        return snapshot_df.copy()
+
+    trade_date_text = _normalize_trade_date_text(trade_date)
+    trade_dates = pd.to_datetime(snapshot_df["last_data_date"], errors="coerce")
+    return snapshot_df[trade_dates.dt.strftime("%Y-%m-%d") == trade_date_text].copy()
 
 
 def _assess_snapshot_quality(snapshot_df, trade_date):
@@ -2515,6 +2521,7 @@ def analysis_gu_piao_data(run_backtest=False, backtest_kwargs=None, expected_tra
             result["backtest_summary"] = {}
         return result
 
+    snapshot = _filter_snapshot_by_trade_date(snapshot, trade_date)
     _clear_strategy_result_bucket(trade_date, MANAGED_DAILY_STRATEGY_TYPES)
     snapshot_quality = _assess_snapshot_quality(snapshot, trade_date)
     if not snapshot_quality["meets_min_coverage"]:
