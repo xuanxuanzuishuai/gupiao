@@ -130,6 +130,7 @@ if __name__ == "__main__":
     fetch_summary = run_stage("抓取个股行情与历史入库", get_gu_piao_info.get_gu_piao_info)
 
     target_trade_date = require_fetch_ready(fetch_summary)
+    # target_trade_date = '2026-05-15'
     risk_overlay_summary = run_stage(
         "刷新风险覆盖表",
         risk_overlay.refresh_latest_risk_overlay,
