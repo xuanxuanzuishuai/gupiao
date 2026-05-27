@@ -2388,46 +2388,40 @@ def _build_long_runway_forward_returns(frame, horizons=LONG_RUNWAY_HORIZONS):
 
 
 def _build_forward_returns(frame, horizons=HORIZON_DAYS):
-    prepared = frame.sort_values(["stock_code", "last_data_date"]).copy()
+    if frame is None or frame.empty:
+        return frame
+
+    prepared = frame.sort_values(["stock_code", "last_data_date"]).reset_index(drop=True).copy()
     cost_pct = (DEFAULT_FEE_BPS + DEFAULT_SLIPPAGE_BPS) * 2 / 100
-    price_columns = ["last_data_date", "stock_code", "latest_price", "today_change"]
-    for column in ["today_open", "today_high", "today_low"]:
-        if column in prepared.columns:
-            price_columns.append(column)
-    price_paths = _build_price_paths(
-        prepared[price_columns],
-        horizons,
-        DEFAULT_ENTRY_OFFSET_DAYS,
-        round_trip_cost_pct=cost_pct,
-    )
+    prepared["latest_price"] = pd.to_numeric(prepared["latest_price"], errors="coerce")
+    prepared["today_change"] = pd.to_numeric(prepared["today_change"], errors="coerce")
+    grouped = prepared.groupby("stock_code", sort=False)
 
-    merge_columns = ["last_data_date", "stock_code", "entry_change"]
-    for horizon_days in horizons:
-        merge_columns.extend(
-            [
-                f"exit_date_{horizon_days}d",
-                f"exit_change_{horizon_days}d",
-                f"gross_return_{horizon_days}d",
-                f"return_{horizon_days}d",
-            ]
-        )
-
-    prepared = prepared.merge(
-        price_paths[merge_columns],
-        on=["last_data_date", "stock_code"],
-        how="left",
-    )
+    entry_offset = int(DEFAULT_ENTRY_OFFSET_DAYS)
+    entry_close = grouped["latest_price"].shift(-entry_offset)
+    entry_close = entry_close.where(entry_close > 0)
+    prepared["entry_change"] = grouped["today_change"].shift(-entry_offset)
+    entry_abs = pd.to_numeric(prepared["entry_change"], errors="coerce").abs()
 
     for horizon_days in horizons:
-        return_col = f"return_{horizon_days}d"
-        gross_return_col = f"gross_return_{horizon_days}d"
+        exit_offset = entry_offset + int(horizon_days)
+        exit_close = grouped["latest_price"].shift(-exit_offset)
         exit_change_col = f"exit_change_{horizon_days}d"
-        entry_abs = pd.to_numeric(prepared["entry_change"], errors="coerce").abs()
+        gross_return_col = f"gross_return_{horizon_days}d"
+        return_col = f"return_{horizon_days}d"
+
+        prepared[f"exit_date_{horizon_days}d"] = grouped["last_data_date"].shift(-exit_offset)
+        prepared[exit_change_col] = grouped["today_change"].shift(-exit_offset)
+        prepared[gross_return_col] = (exit_close - entry_close) / entry_close * 100
+        prepared[return_col] = prepared[gross_return_col] - cost_pct
+
         exit_abs = pd.to_numeric(prepared[exit_change_col], errors="coerce").abs()
         tradable = (entry_abs.isna() | (entry_abs < DEFAULT_LIMIT_PCT)) & (
             exit_abs.isna() | (exit_abs < DEFAULT_LIMIT_PCT)
         )
         prepared.loc[prepared[return_col].notna() & (~tradable), [return_col, gross_return_col]] = pd.NA
+        prepared[gross_return_col] = prepared[gross_return_col].replace([math.inf, -math.inf], pd.NA)
+        prepared[return_col] = prepared[return_col].replace([math.inf, -math.inf], pd.NA)
         prepared[f"forward_return_{horizon_days}d"] = prepared[return_col]
         prepared[f"forward_gross_return_{horizon_days}d"] = prepared[gross_return_col]
         prepared[f"forward_trade_date_{horizon_days}d"] = prepared[f"exit_date_{horizon_days}d"]

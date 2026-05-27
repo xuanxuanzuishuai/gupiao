@@ -645,7 +645,15 @@ def backtest_analysis_gu_piao_history_adaptive_model(
         }
 
     if not history_prepared:
+        raw_trade_days = int(history["last_data_date"].dropna().nunique()) if "last_data_date" in history.columns else 0
+        _emit_runtime_status(
+            f"{SHORT_TERM_MODEL_DISPLAY}回测特征准备开始: rows={len(history)}, trade_days={raw_trade_days}"
+        )
         history = _prepare_short_term_history(history)
+        prepared_trade_days = int(history["last_data_date"].dropna().nunique()) if "last_data_date" in history.columns else 0
+        _emit_runtime_status(
+            f"{SHORT_TERM_MODEL_DISPLAY}回测特征准备完成: rows={len(history)}, trade_days={prepared_trade_days}"
+        )
 
     cached_summary = _load_adaptive_backtest_cache(
         history,

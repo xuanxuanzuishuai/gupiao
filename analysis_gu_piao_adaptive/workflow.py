@@ -37,29 +37,63 @@ def run_adaptive_model_workflow(
             f"target_trade_date 与 end_date 不一致: target_trade_date={target_trade_date_text}, end_date={end_date_text}"
         )
     effective_end_date = target_trade_date_text or end_date
+    should_persist_strategy = (
+        persist_strategy_result
+        and start_date is None
+        and end_date is None
+        and not stock_code
+    )
 
     history_tail_trade_days = None
     short_history_can_tail = not include_backtest and (not include_long_runway or long_runway_use_cache)
     if start_date is None and end_date is None and short_history_can_tail:
         history_tail_trade_days = SHORT_TERM_LOOKBACK_TRADE_DAYS
-        if persist_strategy_result and not stock_code:
-            adaptive_backtest_context_trade_days = _adaptive_backtest_context_trade_days(ADAPTIVE_STRATEGY_TYPE)
+        if should_persist_strategy:
             history_tail_trade_days = max(
                 int(SHORT_TERM_LOOKBACK_TRADE_DAYS),
-                int(adaptive_backtest_context_trade_days),
+                int(ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS),
             )
 
     shared_history_columns = LONG_RUNWAY_FRAME_COLUMNS if include_long_runway else SHORT_TERM_FRAME_COLUMNS
+    _emit_runtime_status(
+        f"{SHORT_TERM_MODEL_DISPLAY}历史读取开始: "
+        f"end_date={_to_date_text(effective_end_date) or 'latest'}, "
+        f"tail_trade_days={history_tail_trade_days or 'all'}, "
+        f"columns={len(shared_history_columns)}"
+    )
     shared_history = _load_history(
         start_date=start_date,
         end_date=effective_end_date,
         tail_trade_days=history_tail_trade_days,
         columns=shared_history_columns,
     )
+    shared_trade_days = (
+        int(shared_history["last_data_date"].dropna().nunique())
+        if shared_history is not None and not shared_history.empty and "last_data_date" in shared_history.columns
+        else 0
+    )
+    _emit_runtime_status(
+        f"{SHORT_TERM_MODEL_DISPLAY}历史读取完成: rows={len(shared_history) if shared_history is not None else 0}, "
+        f"trade_days={shared_trade_days}"
+    )
 
     prepared_short_term_history = None
     if shared_history is not None and not shared_history.empty:
+        _emit_runtime_status(
+            f"{SHORT_TERM_MODEL_DISPLAY}特征准备开始: rows={len(shared_history)}, trade_days={shared_trade_days}"
+        )
         prepared_short_term_history = _prepare_short_term_history(shared_history)
+        prepared_trade_days = (
+            int(prepared_short_term_history["last_data_date"].dropna().nunique())
+            if prepared_short_term_history is not None
+            and not prepared_short_term_history.empty
+            and "last_data_date" in prepared_short_term_history.columns
+            else 0
+        )
+        _emit_runtime_status(
+            f"{SHORT_TERM_MODEL_DISPLAY}特征准备完成: rows={len(prepared_short_term_history)}, "
+            f"trade_days={prepared_trade_days}"
+        )
 
     short_term_history = prepared_short_term_history if prepared_short_term_history is not None else shared_history
     if (
@@ -131,12 +165,6 @@ def run_adaptive_model_workflow(
         "long_runway_backtest": long_runway_backtest_result,
     }
 
-    should_persist_strategy = (
-        persist_strategy_result
-        and start_date is None
-        and end_date is None
-        and not stock_code
-    )
     if should_persist_strategy:
         if target_trade_date_mismatch:
             workflow["strategy_save_result"] = {
@@ -167,17 +195,39 @@ def run_adaptive_model_workflow(
             f"win_rate={adaptive_signal_health.get('trade_win_rate')}, "
             f"reasons={adaptive_signal_health.get('failure_reasons')}"
         )
-        backtest_history = prepared_short_term_history
-        backtest_history_prepared = prepared_short_term_history is not None
         adaptive_backtest_window_trade_days = _adaptive_backtest_health_lookback_trade_days(ADAPTIVE_STRATEGY_TYPE)
         adaptive_backtest_context_trade_days = _adaptive_backtest_context_trade_days(ADAPTIVE_STRATEGY_TYPE)
-        if backtest_history is None or backtest_history.empty:
+        prepared_context_trade_days = (
+            int(prepared_short_term_history["last_data_date"].dropna().nunique())
+            if prepared_short_term_history is not None
+            and not prepared_short_term_history.empty
+            and "last_data_date" in prepared_short_term_history.columns
+            else 0
+        )
+        backtest_history = prepared_short_term_history
+        backtest_history_prepared = prepared_short_term_history is not None
+        if prepared_context_trade_days < int(adaptive_backtest_context_trade_days):
+            _emit_runtime_status(
+                f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}walk-forward上下文读取开始: "
+                f"tail_trade_days={adaptive_backtest_context_trade_days}, "
+                f"当前短线上下文={prepared_context_trade_days}"
+            )
             backtest_history = _load_history(
                 end_date=effective_end_date,
                 tail_trade_days=adaptive_backtest_context_trade_days,
                 columns=SHORT_TERM_FRAME_COLUMNS,
             )
             backtest_history_prepared = False
+            backtest_loaded_trade_days = (
+                int(backtest_history["last_data_date"].dropna().nunique())
+                if backtest_history is not None and not backtest_history.empty
+                else 0
+            )
+            _emit_runtime_status(
+                f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}walk-forward上下文读取完成: "
+                f"rows={len(backtest_history) if backtest_history is not None else 0}, "
+                f"trade_days={backtest_loaded_trade_days}"
+            )
         backtest_trade_days = (
             int(backtest_history["last_data_date"].dropna().nunique())
             if backtest_history is not None and not backtest_history.empty
