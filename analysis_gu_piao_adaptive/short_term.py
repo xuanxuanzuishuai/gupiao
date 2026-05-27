@@ -12,19 +12,54 @@
     backtest_analysis_gu_piao_history_adaptive_model 提供 walk-forward 验证。
 """
 
+import time
+
 from .common import *
 from .scoring import *
 
 
-def _backtest_horizon_profiles(history, top_candidate_count=TOP_CANDIDATE_COUNT, eval_step=1):
-    trade_dates = sorted(history["last_data_date"].dropna().unique())
-    normalized_eval_step = max(1, int(eval_step or 1))
-    eval_trade_dates = trade_dates[::normalized_eval_step]
-    overlay_frame = risk_overlay.build_special_pool_overlay(history, all_dates=True)
-    metrics = {}
+def _build_point_in_time_profiles(history, as_of_date, emit_training_log=False):
+    profile_history = _point_in_time_history_slice(
+        history,
+        as_of_date,
+        tail_trade_days=SHORT_TERM_LOOKBACK_TRADE_DAYS,
+    )
+    horizon_profiles = {}
+    style_horizon_profiles = {}
+    as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
 
     for horizon_days in HORIZON_DAYS:
-        metrics[horizon_days] = {
+        forward_date_col = f"forward_trade_date_{horizon_days}d"
+        if profile_history.empty or forward_date_col not in profile_history.columns:
+            horizon_frame = pd.DataFrame()
+        else:
+            forward_dates = pd.to_datetime(profile_history[forward_date_col], errors="coerce")
+            horizon_frame = profile_history[forward_dates.notna() & forward_dates.le(as_of_ts)].copy()
+
+        profile = _build_horizon_profile(horizon_frame, horizon_days)
+        horizon_profiles[horizon_days] = profile
+        style_horizon_profiles[horizon_days] = _build_style_horizon_profiles(horizon_frame, horizon_days)
+        if emit_training_log:
+            func.logInfo(
+                f"{SHORT_TERM_MODEL_DISPLAY}as-of训练完成 horizon={horizon_days}d, "
+                f"as_of={_to_date_text(as_of_date)}, sample_rows={profile['sample_rows']}, "
+                f"sample_days={profile['sample_days']}, winner_rows={profile['winner_rows']}, "
+                f"loser_rows={profile['loser_rows']}, positive_rate={profile['positive_rate']}%"
+            )
+
+    return profile_history, horizon_profiles, style_horizon_profiles
+
+
+def _resolve_backtest_eval_trade_dates(history, eval_step=1, eval_window_trade_days=None):
+    trade_dates = sorted(history["last_data_date"].dropna().unique())
+    if eval_window_trade_days:
+        trade_dates = trade_dates[-int(eval_window_trade_days):]
+    return trade_dates[:: max(1, int(eval_step or 1))], trade_dates
+
+
+def _empty_backtest_metrics():
+    return {
+        horizon_days: {
             "evaluated_days": 0,
             "universe_return_sum": 0.0,
             "universe_win_sum": 0.0,
@@ -37,39 +72,99 @@ def _backtest_horizon_profiles(history, top_candidate_count=TOP_CANDIDATE_COUNT,
             "style_return_stats": {},
             "market_regime_stats": {},
         }
+        for horizon_days in HORIZON_DAYS
+    }
 
-    for eval_date in eval_trade_dates:
+
+def _backtest_horizon_profiles(
+    history,
+    top_candidate_count=TOP_CANDIDATE_COUNT,
+    eval_step=1,
+    eval_window_trade_days=None,
+):
+    eval_trade_dates, window_trade_dates = _resolve_backtest_eval_trade_dates(
+        history,
+        eval_step=eval_step,
+        eval_window_trade_days=eval_window_trade_days,
+    )
+    total_eval_trade_dates = len(eval_trade_dates)
+    progress_started_at = time.monotonic()
+    metrics = _empty_backtest_metrics()
+    daily_cache_hits = 0
+    daily_cache_misses = 0
+    overlay_frame = risk_overlay.build_special_pool_overlay(history, all_dates=True)
+
+    for eval_index, eval_date in enumerate(eval_trade_dates, start=1):
+        evaluated_days_so_far = max(
+            int(metrics[horizon_days].get("evaluated_days") or 0)
+            for horizon_days in HORIZON_DAYS
+        )
+        _emit_runtime_status(
+            f"{SHORT_TERM_MODEL_DISPLAY}walk-forward进度: "
+            f"{eval_index}/{total_eval_trade_dates}, "
+            f"eval_date={_to_date_text(eval_date)}, "
+            f"effective_eval_days={evaluated_days_so_far}, "
+            f"cache_hit={daily_cache_hits}, cache_miss={daily_cache_misses}, "
+            f"elapsed={int(time.monotonic() - progress_started_at)}s"
+        )
         snapshot = history[history["last_data_date"] == eval_date].copy()
         if snapshot.empty or len(snapshot) < MIN_DAILY_ROWS:
             continue
-        eval_date_text = _to_date_text(eval_date)
-        market_regime = risk_overlay.classify_market_regime(
+
+        decision_context = _point_in_time_history_slice(
+            history,
+            eval_date,
+            tail_trade_days=ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS,
+        )
+        decision = _load_adaptive_daily_decision_cache(
+            decision_context,
+            eval_date,
+            top_candidate_count,
+            include_external=False,
+        )
+        if decision:
+            daily_cache_hits += 1
+        else:
+            daily_cache_misses += 1
+            eval_date_text = _to_date_text(eval_date)
+            eval_overlay_frame = overlay_frame
+            if eval_date_text and overlay_frame is not None and not overlay_frame.empty and "trade_date" in overlay_frame.columns:
+                eval_overlay_frame = overlay_frame[overlay_frame["trade_date"] == eval_date_text].copy()
+            decision = analysis_gu_piao_history_adaptive_model(
+                top_candidate_count=top_candidate_count,
+                history=decision_context,
+                history_prepared=True,
+                as_of_date=eval_date,
+                include_external=False,
+                emit_status=False,
+                use_daily_decision_cache=False,
+                enforce_snapshot_coverage=False,
+                precomputed_overlay_frame=eval_overlay_frame,
+            )
+            if decision:
+                _save_adaptive_daily_decision_cache(
+                    decision_context,
+                    eval_date,
+                    top_candidate_count,
+                    decision,
+                    include_external=False,
+                )
+
+        if not decision.get("success"):
+            continue
+
+        scored = pd.DataFrame(decision.get("top_candidates") or []).head(int(top_candidate_count)).copy()
+        if scored.empty or "stock_code" not in scored.columns:
+            continue
+
+        top_stock_codes = scored["stock_code"].dropna().tolist()
+        if not top_stock_codes:
+            continue
+
+        market_regime = decision.get("market_regime") or risk_overlay.classify_market_regime(
             pd.to_numeric(snapshot.get("market_change_5d"), errors="coerce").mean(),
             pd.to_numeric(snapshot.get("market_breadth_5d"), errors="coerce").mean(),
         )
-
-        eval_horizon_profiles = {}
-        eval_style_profiles = {}
-        for horizon_days in HORIZON_DAYS:
-            horizon_mask = (
-                history[f"forward_trade_date_{horizon_days}d"].notna()
-                & (history[f"forward_trade_date_{horizon_days}d"] <= eval_date)
-            )
-            horizon_frame = history[horizon_mask].copy()
-            eval_horizon_profiles[horizon_days] = _build_horizon_profile(horizon_frame, horizon_days)
-            eval_style_profiles[horizon_days] = _build_style_horizon_profiles(horizon_frame, horizon_days)
-
-        scored = _score_candidates(snapshot, eval_horizon_profiles, eval_style_profiles)
-        scored = _apply_candidate_risk_overlay(
-            scored,
-            history=history,
-            trade_date=eval_date_text,
-            overlay_frame=overlay_frame,
-            filter_blocked=True,
-            filter_downgraded=True,
-        )
-        if scored.empty:
-            continue
 
         for horizon_days in HORIZON_DAYS:
             future_col = f"forward_return_{horizon_days}d"
@@ -77,7 +172,6 @@ def _backtest_horizon_profiles(history, top_candidate_count=TOP_CANDIDATE_COUNT,
                 continue
 
             universe_returns = pd.to_numeric(snapshot[future_col], errors="coerce").dropna()
-            top_stock_codes = scored.head(int(top_candidate_count))["stock_code"].dropna().tolist()
             top_returns = pd.to_numeric(
                 snapshot[snapshot["stock_code"].isin(top_stock_codes)][future_col],
                 errors="coerce",
@@ -85,18 +179,18 @@ def _backtest_horizon_profiles(history, top_candidate_count=TOP_CANDIDATE_COUNT,
             if universe_returns.empty or top_returns.empty:
                 continue
 
-            top_subset = scored.head(int(top_candidate_count)).merge(
+            top_subset = scored.merge(
                 snapshot[["stock_code", future_col]],
                 on="stock_code",
                 how="left",
             )
 
             metrics[horizon_days]["evaluated_days"] += 1
-            metrics[horizon_days]["universe_return_sum"] += float(universe_returns.mean()) if not universe_returns.empty else 0.0
-            metrics[horizon_days]["universe_win_sum"] += float((universe_returns > 0).mean()) if not universe_returns.empty else 0.0
+            metrics[horizon_days]["universe_return_sum"] += float(universe_returns.mean())
+            metrics[horizon_days]["universe_win_sum"] += float((universe_returns > 0).mean())
             metrics[horizon_days]["universe_count"] += 1
-            metrics[horizon_days]["top_return_sum"] += float(top_returns.mean()) if not top_returns.empty else 0.0
-            metrics[horizon_days]["top_win_sum"] += float((top_returns > 0).mean()) if not top_returns.empty else 0.0
+            metrics[horizon_days]["top_return_sum"] += float(top_returns.mean())
+            metrics[horizon_days]["top_win_sum"] += float((top_returns > 0).mean())
             metrics[horizon_days]["top_count"] += 1
 
             regime_stat = metrics[horizon_days]["market_regime_stats"].setdefault(
@@ -112,20 +206,22 @@ def _backtest_horizon_profiles(history, top_candidate_count=TOP_CANDIDATE_COUNT,
                 },
             )
             regime_stat["evaluated_days"] += 1
-            regime_stat["universe_return_sum"] += float(universe_returns.mean()) if not universe_returns.empty else 0.0
-            regime_stat["universe_win_sum"] += float((universe_returns > 0).mean()) if not universe_returns.empty else 0.0
-            regime_stat["top_return_sum"] += float(top_returns.mean()) if not top_returns.empty else 0.0
-            regime_stat["top_win_sum"] += float((top_returns > 0).mean()) if not top_returns.empty else 0.0
+            regime_stat["universe_return_sum"] += float(universe_returns.mean())
+            regime_stat["universe_win_sum"] += float((universe_returns > 0).mean())
+            regime_stat["top_return_sum"] += float(top_returns.mean())
+            regime_stat["top_win_sum"] += float((top_returns > 0).mean())
             regime_stat["top_count"] += 1
 
-            top_scored = scored.head(int(top_candidate_count))
-            for style_name, count in top_scored["style"].fillna("generic").value_counts().items():
+            style_series = scored["style"].fillna("generic") if "style" in scored.columns else pd.Series([], dtype=object)
+            for style_name, count in style_series.value_counts().items():
                 metrics[horizon_days]["top_style_counts"][style_name] = metrics[horizon_days]["top_style_counts"].get(style_name, 0) + int(count)
 
-            for trend_state, count in top_scored["trend_state"].fillna("未知").value_counts().items():
+            trend_series = scored["trend_state"].fillna("未知") if "trend_state" in scored.columns else pd.Series([], dtype=object)
+            for trend_state, count in trend_series.value_counts().items():
                 metrics[horizon_days]["top_trend_state_counts"][trend_state] = metrics[horizon_days]["top_trend_state_counts"].get(trend_state, 0) + int(count)
 
-            for style_name, group in top_subset.groupby(top_subset["style"].fillna("generic")):
+            group_key = top_subset["style"].fillna("generic") if "style" in top_subset.columns else pd.Series("generic", index=top_subset.index)
+            for style_name, group in top_subset.groupby(group_key):
                 returns = pd.to_numeric(group[future_col], errors="coerce").dropna()
                 if returns.empty:
                     continue
@@ -181,6 +277,12 @@ def _backtest_horizon_profiles(history, top_candidate_count=TOP_CANDIDATE_COUNT,
             },
         }
 
+    result["_meta"] = {
+        "daily_decision_cache_hits": daily_cache_hits,
+        "daily_decision_cache_misses": daily_cache_misses,
+        "eval_trade_dates": int(total_eval_trade_dates),
+        "window_trade_days": int(len(window_trade_dates)),
+    }
     return result
 
 
@@ -213,9 +315,16 @@ def analysis_gu_piao_history_adaptive_model(
     stock_code=None,
     history=None,
     history_prepared=False,
+    as_of_date=None,
+    include_external=True,
+    emit_status=True,
+    use_daily_decision_cache=False,
+    enforce_snapshot_coverage=True,
+    precomputed_overlay_frame=None,
 ):
-    func.logInfo(f"开始分析历史上涨票特征（{SHORT_TERM_MODEL_DISPLAY}）")
-    print(f"开始分析历史上涨票特征（{SHORT_TERM_MODEL_DISPLAY}）")
+    if emit_status:
+        func.logInfo(f"开始分析历史上涨票特征（{SHORT_TERM_MODEL_DISPLAY}）")
+        print(f"开始分析历史上涨票特征（{SHORT_TERM_MODEL_DISPLAY}）")
 
     target_stock_code = _normalize_stock_code(stock_code)
 
@@ -238,27 +347,61 @@ def analysis_gu_piao_history_adaptive_model(
     if not history_prepared:
         history = _prepare_short_term_history(history)
 
-    latest_trade_date = history["last_data_date"].max()
+    history["last_data_date"] = pd.to_datetime(history["last_data_date"], errors="coerce")
+    history = history[history["last_data_date"].notna()].copy()
+    latest_trade_date = pd.to_datetime(as_of_date, errors="coerce") if as_of_date is not None else history["last_data_date"].max()
+    if pd.isna(latest_trade_date):
+        latest_trade_date = history["last_data_date"].max()
     latest_trade_date_text = _to_date_text(latest_trade_date)
+
+    decision_context = _point_in_time_history_slice(
+        history,
+        latest_trade_date,
+        tail_trade_days=ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS,
+    )
+    if use_daily_decision_cache and not include_external:
+        cached_decision = _load_adaptive_daily_decision_cache(
+            decision_context,
+            latest_trade_date,
+            top_candidate_count,
+            include_external=False,
+        )
+        if cached_decision:
+            cached_decision = dict(cached_decision)
+            cached_decision["daily_decision_cache"] = "hit"
+            return cached_decision
+
     latest_snapshot = history[history["last_data_date"] == latest_trade_date].copy()
     if latest_snapshot.empty:
-        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}没有可用于评分的最新快照")
+        if emit_status:
+            func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}没有可用于评分的最新快照")
         return {
             "model_version": MODEL_VERSION,
             "model_nature": MODEL_NATURE,
             "success": False,
             "reason": "snapshot_empty",
+            "latest_trade_date": latest_trade_date_text,
             "top_candidates": [],
         }
 
-    snapshot_coverage = _assess_snapshot_coverage(latest_snapshot)
+    if enforce_snapshot_coverage:
+        snapshot_coverage = _assess_snapshot_coverage(latest_snapshot)
+    else:
+        snapshot_coverage = {
+            "trade_date": latest_trade_date_text,
+            "trade_date_count": int(len(latest_snapshot)),
+            "universe_count": int(len(latest_snapshot)),
+            "coverage_ratio": 100.0,
+            "meets_min_coverage": True,
+        }
     if not snapshot_coverage["meets_min_coverage"]:
-        func.logInfo(
-            f"{SHORT_TERM_MODEL_DISPLAY}最新快照覆盖不足，跳过推荐: trade_date={snapshot_coverage['trade_date']}, "
-            f"coverage={snapshot_coverage['coverage_ratio']}%, "
-            f"trade_date_count={snapshot_coverage['trade_date_count']}, "
-            f"universe_count={snapshot_coverage['universe_count']}"
-        )
+        if emit_status:
+            func.logInfo(
+                f"{SHORT_TERM_MODEL_DISPLAY}最新快照覆盖不足，跳过推荐: trade_date={snapshot_coverage['trade_date']}, "
+                f"coverage={snapshot_coverage['coverage_ratio']}%, "
+                f"trade_date_count={snapshot_coverage['trade_date_count']}, "
+                f"universe_count={snapshot_coverage['universe_count']}"
+            )
         return {
             "model_version": MODEL_VERSION,
             "model_nature": MODEL_NATURE,
@@ -271,21 +414,16 @@ def analysis_gu_piao_history_adaptive_model(
             "top_candidates": [],
         }
 
-    horizon_profiles = {}
-    style_horizon_profiles = {}
-    for horizon_days in HORIZON_DAYS:
-        profile = _build_horizon_profile(history, horizon_days)
-        horizon_profiles[horizon_days] = profile
-        style_horizon_profiles[horizon_days] = _build_style_horizon_profiles(history, horizon_days)
-        func.logInfo(
-            f"{SHORT_TERM_MODEL_DISPLAY}训练完成 horizon={horizon_days}d, sample_rows={profile['sample_rows']}, "
-            f"sample_days={profile['sample_days']}, winner_rows={profile['winner_rows']}, "
-            f"loser_rows={profile['loser_rows']}, positive_rate={profile['positive_rate']}%"
-        )
+    profile_history, horizon_profiles, style_horizon_profiles = _build_point_in_time_profiles(
+        history,
+        latest_trade_date,
+        emit_training_log=emit_status,
+    )
 
     candidate_df = _score_candidates(latest_snapshot, horizon_profiles, style_horizon_profiles)
     if candidate_df.empty:
-        func.logInfo("最新快照没有形成有效评分")
+        if emit_status:
+            func.logInfo("最新快照没有形成有效评分")
         return {
             "model_version": MODEL_VERSION,
             "model_nature": MODEL_NATURE,
@@ -295,13 +433,22 @@ def analysis_gu_piao_history_adaptive_model(
             "top_candidates": [],
         }
 
-    overlay_frame = risk_overlay.build_special_pool_overlay(history, trade_date=latest_trade_date_text)
+    risk_context = _point_in_time_history_slice(
+        history,
+        latest_trade_date,
+        tail_trade_days=ADAPTIVE_RISK_CONTEXT_TRADE_DAYS,
+    )
+    overlay_frame = (
+        precomputed_overlay_frame
+        if precomputed_overlay_frame is not None and not precomputed_overlay_frame.empty
+        else risk_overlay.build_special_pool_overlay(risk_context, trade_date=latest_trade_date_text)
+    )
     candidate_with_overlay = _apply_candidate_risk_overlay(
         candidate_df,
-        history=history,
+        history=risk_context,
         trade_date=latest_trade_date_text,
         overlay_frame=overlay_frame,
-        include_external=True,
+        include_external=include_external,
         filter_blocked=False,
         score_penalty_multiplier=EXTERNAL_RISK_SCORE_PENALTY_MULTIPLIER,
     )
@@ -326,16 +473,17 @@ def analysis_gu_piao_history_adaptive_model(
         special_pool_candidates_df = pd.DataFrame()
     candidate_df = _apply_candidate_risk_overlay(
         candidate_df,
-        history=history,
+        history=risk_context,
         trade_date=latest_trade_date_text,
         overlay_frame=overlay_frame,
-        include_external=True,
+        include_external=include_external,
         filter_blocked=True,
         filter_downgraded=True,
         score_penalty_multiplier=EXTERNAL_RISK_SCORE_PENALTY_MULTIPLIER,
     )
     if candidate_df.empty:
-        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}最新快照经特殊股票池/事件风险覆盖后没有形成正式候选")
+        if emit_status:
+            func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}最新快照经特殊股票池/事件风险覆盖后没有形成正式候选")
         return {
             "model_version": MODEL_VERSION,
             "model_nature": MODEL_NATURE,
@@ -372,10 +520,15 @@ def analysis_gu_piao_history_adaptive_model(
         "model_version": MODEL_VERSION,
         "model_nature": MODEL_NATURE,
         "success": True,
-        "sample_start": str(history["last_data_date"].min().date()),
-        "sample_end": str(history["last_data_date"].max().date()),
-        "trade_days": int(history["last_data_date"].nunique()),
-        "history_rows": int(len(history)),
+        "decision_context": "point_in_time",
+        "as_of_date": latest_trade_date_text,
+        "sample_start": str(profile_history["last_data_date"].min().date()) if not profile_history.empty else None,
+        "sample_end": str(profile_history["last_data_date"].max().date()) if not profile_history.empty else latest_trade_date_text,
+        "trade_days": int(profile_history["last_data_date"].nunique()) if not profile_history.empty else 0,
+        "history_rows": int(len(profile_history)),
+        "risk_context_start": str(risk_context["last_data_date"].min().date()) if not risk_context.empty else None,
+        "risk_context_trade_days": int(risk_context["last_data_date"].nunique()) if not risk_context.empty else 0,
+        "risk_context_rows": int(len(risk_context)),
         "latest_trade_date": latest_trade_date_text,
         "snapshot_coverage_ratio": snapshot_coverage["coverage_ratio"],
         "snapshot_trade_date_count": snapshot_coverage["trade_date_count"],
@@ -444,16 +597,27 @@ def analysis_gu_piao_history_adaptive_model(
         },
     }
 
-    func.logInfo(model_note)
-    func.logInfo(
-        f"{SHORT_TERM_MODEL_DISPLAY}分析完成: trade_days={summary['trade_days']}, history_rows={summary['history_rows']}, "
-        f"market_env={market_env}, market_regime={market_regime}, top_candidates={len(summary['top_candidates'])}"
-    )
-    func.logInfo({
-        "top_families": top_families[:3],
-        "top_features": top_features[:5],
-    })
-    print(f"{SHORT_TERM_MODEL_DISPLAY}分析完毕")
+    if use_daily_decision_cache and not include_external:
+        _save_adaptive_daily_decision_cache(
+            decision_context,
+            latest_trade_date,
+            top_candidate_count,
+            summary,
+            include_external=False,
+        )
+
+    if emit_status:
+        func.logInfo(model_note)
+        func.logInfo(
+            f"{SHORT_TERM_MODEL_DISPLAY}分析完成: trade_days={summary['trade_days']}, history_rows={summary['history_rows']}, "
+            f"risk_context_trade_days={summary['risk_context_trade_days']}, "
+            f"market_env={market_env}, market_regime={market_regime}, top_candidates={len(summary['top_candidates'])}"
+        )
+        func.logInfo({
+            "top_families": top_families[:3],
+            "top_features": top_features[:5],
+        })
+        print(f"{SHORT_TERM_MODEL_DISPLAY}分析完毕")
     return summary
 
 
@@ -464,6 +628,7 @@ def backtest_analysis_gu_piao_history_adaptive_model(
     history=None,
     history_prepared=False,
     eval_step=1,
+    eval_window_trade_days=None,
 ):
     func.logInfo(f"开始回测{SHORT_TERM_MODEL_DISPLAY}（walk-forward）")
     print(f"开始回测{SHORT_TERM_MODEL_DISPLAY}（walk-forward）")
@@ -482,18 +647,40 @@ def backtest_analysis_gu_piao_history_adaptive_model(
     if not history_prepared:
         history = _prepare_short_term_history(history)
 
-    trade_dates = history["last_data_date"].dropna().nunique()
+    cached_summary = _load_adaptive_backtest_cache(
+        history,
+        top_candidate_count,
+        eval_step,
+        eval_window_trade_days=eval_window_trade_days,
+    )
+    if cached_summary:
+        print(f"{SHORT_TERM_MODEL_DISPLAY}回测使用缓存")
+        return cached_summary
+
+    _, window_trade_dates = _resolve_backtest_eval_trade_dates(
+        history,
+        eval_step=eval_step,
+        eval_window_trade_days=eval_window_trade_days,
+    )
+    context_trade_dates = history["last_data_date"].dropna().nunique()
     backtest_result = _backtest_horizon_profiles(
         history,
         top_candidate_count=top_candidate_count,
         eval_step=eval_step,
+        eval_window_trade_days=eval_window_trade_days,
     )
+    backtest_meta = backtest_result.pop("_meta", {})
 
     summary = {
         "model_version": MODEL_VERSION,
         "success": True,
-        "trade_days": int(trade_dates),
+        "decision_context": "point_in_time_daily",
+        "trade_days": int(len(window_trade_dates)),
+        "context_trade_days": int(context_trade_dates),
         "eval_step": max(1, int(eval_step or 1)),
+        "eval_window_trade_days": int(eval_window_trade_days or 0),
+        "daily_decision_cache_hits": int(backtest_meta.get("daily_decision_cache_hits") or 0),
+        "daily_decision_cache_misses": int(backtest_meta.get("daily_decision_cache_misses") or 0),
         "backtest": {
             f"{horizon_days}d": metrics
             for horizon_days, metrics in backtest_result.items()
@@ -503,6 +690,13 @@ def backtest_analysis_gu_piao_history_adaptive_model(
     func.logInfo({
         "backtest": summary["backtest"],
     })
+    _save_adaptive_backtest_cache(
+        history,
+        top_candidate_count,
+        eval_step,
+        summary,
+        eval_window_trade_days=eval_window_trade_days,
+    )
     print(f"{SHORT_TERM_MODEL_DISPLAY}回测完毕")
     return summary
 

@@ -45,14 +45,15 @@ def run_adaptive_model_workflow(
         if persist_strategy_result and not stock_code:
             history_tail_trade_days = max(
                 int(SHORT_TERM_LOOKBACK_TRADE_DAYS),
-                int(ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS),
+                int(ADAPTIVE_BACKTEST_CONTEXT_TRADE_DAYS),
             )
 
+    shared_history_columns = LONG_RUNWAY_FRAME_COLUMNS if include_long_runway else SHORT_TERM_FRAME_COLUMNS
     shared_history = _load_history(
         start_date=start_date,
         end_date=effective_end_date,
         tail_trade_days=history_tail_trade_days,
-        columns=LONG_RUNWAY_FRAME_COLUMNS,
+        columns=shared_history_columns,
     )
 
     prepared_short_term_history = None
@@ -65,6 +66,7 @@ def run_adaptive_model_workflow(
         and history_tail_trade_days > SHORT_TERM_LOOKBACK_TRADE_DAYS
         and (not include_long_runway or long_runway_use_cache)
         and not include_backtest
+        and not persist_strategy_result
     ):
         short_term_history = _tail_trade_days_frame(short_term_history, SHORT_TERM_LOOKBACK_TRADE_DAYS)
 
@@ -135,9 +137,6 @@ def run_adaptive_model_workflow(
         and not stock_code
     )
     if should_persist_strategy:
-        if target_trade_date_text:
-            clear_adaptive_strategy_results(target_trade_date_text)
-
         if target_trade_date_mismatch:
             workflow["strategy_save_result"] = {
                 "success": False,
@@ -172,8 +171,8 @@ def run_adaptive_model_workflow(
         if backtest_history is None or backtest_history.empty:
             backtest_history = _load_history(
                 end_date=effective_end_date,
-                tail_trade_days=ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS,
-                columns=LONG_RUNWAY_FRAME_COLUMNS,
+                tail_trade_days=ADAPTIVE_BACKTEST_CONTEXT_TRADE_DAYS,
+                columns=SHORT_TERM_FRAME_COLUMNS,
             )
             backtest_history_prepared = False
         backtest_trade_days = (
@@ -193,6 +192,7 @@ def run_adaptive_model_workflow(
                 history=backtest_history,
                 history_prepared=backtest_history_prepared,
                 eval_step=1,
+                eval_window_trade_days=ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS,
             )
             _emit_runtime_status(
                 f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}walk-forward回测: model={SHORT_TERM_MODEL_DISPLAY}, 完成, success={adaptive_backtest.get('success')}, "

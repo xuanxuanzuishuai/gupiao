@@ -97,10 +97,31 @@ def _normalize_stock_code(value):
 
 
 def _to_date_text(value):
+    if isinstance(value, str):
+        text = value.strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+            return text[:10]
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if hasattr(value, "strftime") and not pd.isna(value):
+        return value.strftime("%Y-%m-%d")
     ts = pd.to_datetime(value, errors="coerce")
     if pd.isna(ts):
         return None
     return ts.strftime("%Y-%m-%d")
+
+
+def _to_date_text_series(series):
+    if series is None:
+        return pd.Series(dtype="object")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series.dt.strftime("%Y-%m-%d")
+    text = series.astype("string")
+    prefix = text.str.slice(0, 10)
+    simple_mask = prefix.str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)
+    if bool((simple_mask | text.isna()).fillna(False).all()):
+        return prefix.where(text.notna(), None).astype(object)
+    return pd.to_datetime(series, errors="coerce").dt.strftime("%Y-%m-%d")
 
 
 def _to_compact_date(value):
@@ -541,6 +562,8 @@ def build_special_pool_overlay(history, trade_date=None, all_dates=False, adapti
     global_first_trade_date = frame["last_data_date"].min()
     first_seen = frame.groupby("stock_code")["last_data_date"].transform("min")
     frame["first_seen_date"] = first_seen
+    frame["trade_date_text"] = _to_date_text_series(frame["last_data_date"])
+    frame["first_seen_date_text"] = _to_date_text_series(frame["first_seen_date"])
     frame["probable_new_listing"] = first_seen > (global_first_trade_date + pd.Timedelta(days=7))
     frame["board_limit_pct"] = frame.apply(
         lambda row: _board_limit_pct(
@@ -594,10 +617,10 @@ def build_special_pool_overlay(history, trade_date=None, all_dates=False, adapti
             risk_note += f"；动态风控:{overlay['adaptive_risk_overlay_note']}"
         overlay_records.append(
             {
-                "trade_date": _to_date_text(row.get("last_data_date")),
+                "trade_date": row.get("trade_date_text"),
                 "stock_code": row.get("stock_code"),
                 "stock_name": row.get("stock_name"),
-                "first_seen_date": _to_date_text(row.get("first_seen_date")),
+                "first_seen_date": row.get("first_seen_date_text"),
                 "listing_trade_days": int(row.get("listing_trade_days") or 0),
                 "probable_new_listing": _normalize_bool(row.get("probable_new_listing")),
                 "board_limit_pct": _round_or_none(row.get("board_limit_pct"), 2),
@@ -1141,15 +1164,15 @@ def _overlay_for_candidates(candidate_df, history=None, trade_date=None, overlay
         overlay_frame = build_special_pool_overlay(history, trade_date=trade_date)
     if overlay_frame is None or overlay_frame.empty:
         return pd.DataFrame()
-    overlay = overlay_frame.copy()
-    overlay["stock_code"] = overlay["stock_code"].apply(_normalize_stock_code)
     trade_date_text = _to_date_text(trade_date)
+    overlay = overlay_frame.copy()
     if "trade_date" not in overlay.columns:
         overlay["trade_date"] = trade_date_text
     else:
-        overlay["trade_date"] = overlay["trade_date"].apply(_to_date_text)
+        overlay["trade_date"] = _to_date_text_series(overlay["trade_date"])
     if trade_date_text:
         overlay = overlay[overlay["trade_date"] == trade_date_text].copy()
+    overlay["stock_code"] = overlay["stock_code"].apply(_normalize_stock_code)
     return overlay
 
 
@@ -1436,6 +1459,24 @@ def upsert_risk_overlay(overlay_frame):
             connection.close()
 
 
+def _project_root():
+    return Path(__file__).resolve().parents[1]
+
+
+def _adaptive_risk_report_dir():
+    configured_log_path = func.getenv("LOG_PATH")
+    if configured_log_path:
+        return Path(configured_log_path).expanduser().resolve()
+    return _project_root() / DEFAULT_ADAPTIVE_RISK_REPORT_DIR
+
+
+def _resolve_adaptive_report_path(output_target):
+    output_path = Path(output_target).expanduser()
+    if output_path.is_absolute():
+        return output_path
+    return _project_root() / output_path
+
+
 def _default_adaptive_report_path(result=None, trade_date=None):
     report_date = _to_date_text(trade_date)
     if not report_date:
@@ -1445,7 +1486,7 @@ def _default_adaptive_report_path(result=None, trade_date=None):
     if not report_date:
         report_date = datetime.now().strftime("%Y-%m-%d")
     compact_date = _to_compact_date(report_date) or datetime.now().strftime("%Y%m%d")
-    return str(Path(DEFAULT_ADAPTIVE_RISK_REPORT_DIR) / f"{DEFAULT_ADAPTIVE_RISK_REPORT_PREFIX}_{compact_date}.md")
+    return str(_adaptive_risk_report_dir() / f"{DEFAULT_ADAPTIVE_RISK_REPORT_PREFIX}_{compact_date}.md")
 
 
 def _run_adaptive_risk_overlay_model(
@@ -1472,9 +1513,7 @@ def _run_adaptive_risk_overlay_model(
                 result=result,
                 trade_date=trade_date,
             )
-            output_path = Path(output_target).expanduser()
-            if not output_path.is_absolute():
-                output_path = Path.cwd() / output_path
+            output_path = _resolve_adaptive_report_path(output_target)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(
                 adaptive_model.format_markdown_report(result, focus_hold_days=adaptive_focus_hold_days),

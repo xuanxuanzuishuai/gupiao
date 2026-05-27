@@ -200,7 +200,6 @@ def persist_adaptive_candidates_to_strategy_result(
 ):
     short_term = (workflow or {}).get("short_term_recommendation") or {}
     trade_date = short_term.get("latest_trade_date")
-    _clear_adaptive_strategy_rows(trade_date)
 
     if not short_term.get("success"):
         _emit_runtime_status(
@@ -342,6 +341,7 @@ def persist_adaptive_candidates_to_strategy_result(
 
     if not selected_candidates:
         final_filter_reason = final_filter_reason or "candidate_empty_after_final_risk_overlay"
+        _clear_adaptive_strategy_rows(trade_date)
         _emit_runtime_status(
             f"{SHORT_TERM_MODEL_DISPLAY}落库完成: trade_date={trade_date}, saved_count=0, "
             f"reason={final_filter_reason}"
@@ -356,6 +356,7 @@ def persist_adaptive_candidates_to_strategy_result(
 
     saved_count = 0
     total_count = len(selected_candidates)
+    _clear_adaptive_strategy_rows(trade_date)
     for index, candidate in enumerate(selected_candidates, start=1):
         func.executeInsert(
             "a_stock_strategy_result",
