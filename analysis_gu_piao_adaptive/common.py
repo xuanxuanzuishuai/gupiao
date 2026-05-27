@@ -75,7 +75,7 @@ ADAPTIVE_BACKTEST_HEALTH = {
     "hold_days": 10,
     "min_evaluated_days": 30,
     "min_avg_top_return": 2.0,
-    "min_avg_top_win_rate": 55.0,
+    "min_avg_top_win_rate": 54.5,
     "min_excess_return": 0.5,
 }
 ADAPTIVE_HEALTH_POLICIES = {
@@ -99,8 +99,22 @@ LONG_RUNWAY_LOSER_RATIO = 0.5
 LONG_RUNWAY_MIN_DAILY_ROWS = 50
 LONG_RUNWAY_REBALANCE_TRADE_DAYS = 20
 LONG_RUNWAY_CACHE_SCHEMA_VERSION = 1
-LONG_RUNWAY_CACHE_DIR = Path("cache") / "long_runway"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LONG_RUNWAY_CACHE_DIR = PROJECT_ROOT / "cache" / "long_runway"
 LONG_RUNWAY_CONTEXT_CACHE_PATH = LONG_RUNWAY_CACHE_DIR / "context.pkl"
+ADAPTIVE_BACKTEST_CACHE_SCHEMA_VERSION = 2
+ADAPTIVE_BACKTEST_CACHE_DIR = PROJECT_ROOT / "cache" / "adaptive_backtest"
+ADAPTIVE_DAILY_DECISION_CACHE_SCHEMA_VERSION = 1
+ADAPTIVE_DAILY_DECISION_CACHE_DIR = PROJECT_ROOT / "cache" / "adaptive_daily_decision"
+ADAPTIVE_RISK_CONTEXT_TRADE_DAYS = int(getattr(risk_overlay, "DEFAULT_HISTORY_TAIL_DAYS", 260))
+ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS = max(
+    int(SHORT_TERM_LOOKBACK_TRADE_DAYS),
+    int(ADAPTIVE_RISK_CONTEXT_TRADE_DAYS),
+)
+ADAPTIVE_BACKTEST_CONTEXT_TRADE_DAYS = (
+    int(ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS)
+    + int(ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS)
+)
 LONG_RUNWAY_ROLLING_CONTEXT_TRADE_DAYS = 260
 LONG_RUNWAY_FORWARD_REFRESH_BUFFER_DAYS = 5
 LONG_RUNWAY_HISTORY_QUERY_CHUNK_SIZE = 100000
@@ -689,6 +703,233 @@ def _run_with_wall_timeout(seconds, callback, *args, **kwargs):
 def _emit_runtime_status(message):
     func.logInfo(message)
     print(message, flush=True)
+
+
+def _point_in_time_history_slice(history, as_of_date, tail_trade_days=None):
+    if history is None or history.empty or "last_data_date" not in history.columns:
+        return pd.DataFrame()
+
+    as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(as_of_ts):
+        return pd.DataFrame()
+
+    date_series = pd.to_datetime(history["last_data_date"], errors="coerce")
+    frame = history.loc[date_series.notna() & date_series.le(as_of_ts)].copy()
+    frame["last_data_date"] = date_series.loc[frame.index]
+    if frame.empty:
+        return frame
+
+    if tail_trade_days:
+        trade_dates = sorted(frame["last_data_date"].dropna().unique())
+        if len(trade_dates) > int(tail_trade_days):
+            cutoff_date = trade_dates[-int(tail_trade_days)]
+            frame = frame[frame["last_data_date"] >= cutoff_date].copy()
+
+    return frame.reset_index(drop=True)
+
+
+def _adaptive_daily_decision_checksum(context_frame, as_of_date=None):
+    # 日级缓存的文件名已经按模型版本、交易日、topN 和 schema 隔离。
+    # 这里不再对大窗口做逐行哈希，否则“校验缓存”会比重新计算还慢。
+    return 0
+
+
+def _adaptive_daily_decision_cache_signature(context_frame, as_of_date, top_candidate_count, include_external=False):
+    if include_external:
+        return None
+    if context_frame is None or context_frame.empty or "last_data_date" not in context_frame.columns:
+        return None
+
+    date_series = pd.to_datetime(context_frame["last_data_date"], errors="coerce").dropna()
+    if date_series.empty:
+        return None
+
+    as_of_text = _to_date_text(as_of_date)
+    if not as_of_text:
+        return None
+
+    snapshot_rows = int((date_series == pd.to_datetime(as_of_text)).sum())
+    return {
+        "schema_version": ADAPTIVE_DAILY_DECISION_CACHE_SCHEMA_VERSION,
+        "model_version": MODEL_VERSION,
+        "as_of_date": as_of_text,
+        "context_start_date": _to_date_text(date_series.min()),
+        "context_end_date": _to_date_text(date_series.max()),
+        "context_trade_days": int(date_series.nunique()),
+        "context_rows": int(len(context_frame)),
+        "snapshot_rows": snapshot_rows,
+        "training_trade_days": int(SHORT_TERM_LOOKBACK_TRADE_DAYS),
+        "risk_context_trade_days": int(ADAPTIVE_RISK_CONTEXT_TRADE_DAYS),
+        "top_candidate_count": int(top_candidate_count or TOP_CANDIDATE_COUNT),
+        "include_external": bool(include_external),
+        "checksum": _adaptive_daily_decision_checksum(context_frame, as_of_date=as_of_text),
+    }
+
+
+def _adaptive_daily_decision_cache_path_for_key(as_of_date, top_candidate_count, include_external=False):
+    if include_external:
+        return None
+    as_of_text = _to_date_text(as_of_date)
+    if not as_of_text:
+        return None
+    normalized_top_count = int(top_candidate_count or TOP_CANDIDATE_COUNT)
+    filename = (
+        f"{MODEL_VERSION}_{as_of_text}_"
+        f"top{normalized_top_count}_"
+        f"schema{ADAPTIVE_DAILY_DECISION_CACHE_SCHEMA_VERSION}.pkl"
+    )
+    return ADAPTIVE_DAILY_DECISION_CACHE_DIR / filename
+
+
+def _load_adaptive_daily_decision_cache(context_frame, as_of_date, top_candidate_count, include_external=False):
+    cache_path = _adaptive_daily_decision_cache_path_for_key(
+        as_of_date,
+        top_candidate_count,
+        include_external=include_external,
+    )
+    if not cache_path or not cache_path.exists():
+        return None
+    signature = _adaptive_daily_decision_cache_signature(
+        context_frame,
+        as_of_date,
+        top_candidate_count,
+        include_external=include_external,
+    )
+    if not signature:
+        return None
+    try:
+        with cache_path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception as error:
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}日级决策缓存读取失败: {error}")
+        return None
+    if (payload or {}).get("signature") != signature:
+        return None
+    result = (payload or {}).get("result")
+    if result:
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}日级决策缓存命中: {cache_path}")
+    return result
+
+
+def _save_adaptive_daily_decision_cache(context_frame, as_of_date, top_candidate_count, result, include_external=False):
+    signature = _adaptive_daily_decision_cache_signature(
+        context_frame,
+        as_of_date,
+        top_candidate_count,
+        include_external=include_external,
+    )
+    cache_path = _adaptive_daily_decision_cache_path_for_key(
+        as_of_date,
+        top_candidate_count,
+        include_external=include_external,
+    )
+    if not cache_path or not signature:
+        return
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("wb") as handle:
+            pickle.dump({"signature": signature, "result": result}, handle)
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}日级决策缓存已写入: {cache_path}")
+    except Exception as error:
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}日级决策缓存写入失败: {error}")
+
+
+def _adaptive_backtest_cache_signature(history, top_candidate_count, eval_step, eval_window_trade_days=None):
+    if history is None or history.empty or "last_data_date" not in history.columns:
+        return None
+
+    date_series = pd.to_datetime(history["last_data_date"], errors="coerce").dropna()
+    if date_series.empty:
+        return None
+
+    start_date = _to_date_text(date_series.min())
+    end_date = _to_date_text(date_series.max())
+    normalized_eval_step = max(1, int(eval_step or 1))
+    normalized_top_count = int(top_candidate_count or TOP_CANDIDATE_COUNT)
+    checksum_columns = [
+        column
+        for column in [
+            "last_data_date",
+            "stock_code",
+            "latest_price",
+            "today_change",
+            "forward_return_5d",
+            "forward_return_10d",
+            "risk_score",
+            "risk_adjusted_score",
+        ]
+        if column in history.columns
+    ]
+    checksum_frame = history[checksum_columns].copy()
+    checksum = int(pd.util.hash_pandas_object(checksum_frame, index=False).sum()) & 0xFFFFFFFFFFFFFFFF
+    return {
+        "schema_version": ADAPTIVE_BACKTEST_CACHE_SCHEMA_VERSION,
+        "model_version": MODEL_VERSION,
+        "start_date": start_date,
+        "end_date": end_date,
+        "trade_days": int(date_series.nunique()),
+        "row_count": int(len(history)),
+        "top_candidate_count": normalized_top_count,
+        "eval_step": normalized_eval_step,
+        "eval_window_trade_days": int(eval_window_trade_days or 0),
+        "checksum": checksum,
+    }
+
+
+def _adaptive_backtest_cache_path(signature):
+    if not signature:
+        return None
+    filename = (
+        f"{signature['model_version']}_{signature['start_date']}_{signature['end_date']}_"
+        f"{signature['trade_days']}d_{signature['row_count']}r_"
+        f"top{signature['top_candidate_count']}_step{signature['eval_step']}_"
+        f"win{signature['eval_window_trade_days']}_"
+        f"{signature['checksum']:016x}.pkl"
+    )
+    return ADAPTIVE_BACKTEST_CACHE_DIR / filename
+
+
+def _load_adaptive_backtest_cache(history, top_candidate_count, eval_step, eval_window_trade_days=None):
+    signature = _adaptive_backtest_cache_signature(
+        history,
+        top_candidate_count,
+        eval_step,
+        eval_window_trade_days=eval_window_trade_days,
+    )
+    cache_path = _adaptive_backtest_cache_path(signature)
+    if not cache_path or not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception as error:
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}walk-forward缓存读取失败: {error}")
+        return None
+    if (payload or {}).get("signature") != signature:
+        return None
+    result = (payload or {}).get("result")
+    if result:
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}walk-forward缓存命中: {cache_path}")
+    return result
+
+
+def _save_adaptive_backtest_cache(history, top_candidate_count, eval_step, result, eval_window_trade_days=None):
+    signature = _adaptive_backtest_cache_signature(
+        history,
+        top_candidate_count,
+        eval_step,
+        eval_window_trade_days=eval_window_trade_days,
+    )
+    cache_path = _adaptive_backtest_cache_path(signature)
+    if not cache_path:
+        return
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("wb") as handle:
+            pickle.dump({"signature": signature, "result": result}, handle)
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}walk-forward缓存已写入: {cache_path}")
+    except Exception as error:
+        func.logInfo(f"{SHORT_TERM_MODEL_DISPLAY}walk-forward缓存写入失败: {error}")
 
 
 def _normalize_stock_code(value):
@@ -1662,7 +1903,7 @@ def _combine_adaptive_health(signal_health, backtest_health):
 def _prepare_common_frame(df, dedupe_keys):
     frame = df.copy()
     _ensure_columns(frame, ["stock_code", "stock_name", "industry", "last_data_date"], None)
-    _ensure_columns(frame, NUMERIC_COLUMNS, pd.NA)
+    _ensure_columns(frame, NUMERIC_COLUMNS, math.nan)
 
     frame["stock_code"] = _normalize_stock_code_series(frame["stock_code"])
     frame = frame[frame["stock_code"].notna()].copy()

@@ -1023,7 +1023,7 @@ def main():
     )
 
     if args.output_md:
-        output_path = Path(args.output_md).expanduser().resolve()
+        output_path = risk_overlay._resolve_adaptive_report_path(args.output_md)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(format_markdown_report(result, focus_hold_days=args.focus_hold_days), encoding="utf-8")
         func.logInfo(f"风险覆盖层分支回测报告已输出: {output_path}")
@@ -1033,7 +1033,7 @@ def main():
     else:
         _print_console_summary(result, focus_hold_days=args.focus_hold_days)
         if args.output_md:
-            print(f"\nMarkdown报告: {Path(args.output_md).expanduser().resolve()}")
+            print(f"\nMarkdown报告: {output_path}")
 
 
 if __name__ == "__main__":
