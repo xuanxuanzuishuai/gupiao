@@ -43,9 +43,10 @@ def run_adaptive_model_workflow(
     if start_date is None and end_date is None and short_history_can_tail:
         history_tail_trade_days = SHORT_TERM_LOOKBACK_TRADE_DAYS
         if persist_strategy_result and not stock_code:
+            adaptive_backtest_context_trade_days = _adaptive_backtest_context_trade_days(ADAPTIVE_STRATEGY_TYPE)
             history_tail_trade_days = max(
                 int(SHORT_TERM_LOOKBACK_TRADE_DAYS),
-                int(ADAPTIVE_BACKTEST_CONTEXT_TRADE_DAYS),
+                int(adaptive_backtest_context_trade_days),
             )
 
     shared_history_columns = LONG_RUNWAY_FRAME_COLUMNS if include_long_runway else SHORT_TERM_FRAME_COLUMNS
@@ -168,10 +169,12 @@ def run_adaptive_model_workflow(
         )
         backtest_history = prepared_short_term_history
         backtest_history_prepared = prepared_short_term_history is not None
+        adaptive_backtest_window_trade_days = _adaptive_backtest_health_lookback_trade_days(ADAPTIVE_STRATEGY_TYPE)
+        adaptive_backtest_context_trade_days = _adaptive_backtest_context_trade_days(ADAPTIVE_STRATEGY_TYPE)
         if backtest_history is None or backtest_history.empty:
             backtest_history = _load_history(
                 end_date=effective_end_date,
-                tail_trade_days=ADAPTIVE_BACKTEST_CONTEXT_TRADE_DAYS,
+                tail_trade_days=adaptive_backtest_context_trade_days,
                 columns=SHORT_TERM_FRAME_COLUMNS,
             )
             backtest_history_prepared = False
@@ -182,7 +185,7 @@ def run_adaptive_model_workflow(
         )
         _emit_runtime_status(
             f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}walk-forward回测: model={SHORT_TERM_MODEL_DISPLAY}, 开始, trade_days={backtest_trade_days}, "
-            f"eval_step=1, timeout={ADAPTIVE_PERSIST_BACKTEST_TIMEOUT_SECONDS}s"
+            f"window={adaptive_backtest_window_trade_days}, eval_step=1, timeout={ADAPTIVE_PERSIST_BACKTEST_TIMEOUT_SECONDS}s"
         )
         try:
             adaptive_backtest = _run_with_wall_timeout(
@@ -192,11 +195,12 @@ def run_adaptive_model_workflow(
                 history=backtest_history,
                 history_prepared=backtest_history_prepared,
                 eval_step=1,
-                eval_window_trade_days=ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS,
+                eval_window_trade_days=adaptive_backtest_window_trade_days,
             )
             _emit_runtime_status(
                 f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}walk-forward回测: model={SHORT_TERM_MODEL_DISPLAY}, 完成, success={adaptive_backtest.get('success')}, "
-                f"trade_days={adaptive_backtest.get('trade_days')}, eval_step={adaptive_backtest.get('eval_step')}"
+                f"trade_days={adaptive_backtest.get('trade_days')}, window={adaptive_backtest_window_trade_days}, "
+                f"eval_step={adaptive_backtest.get('eval_step')}"
             )
         except TimeoutError as error:
             adaptive_backtest = {
@@ -207,13 +211,17 @@ def run_adaptive_model_workflow(
                 if backtest_history is not None and not backtest_history.empty
                 else 0,
                 "eval_step": 1,
+                "eval_window_trade_days": adaptive_backtest_window_trade_days,
                 "backtest": {},
             }
             _emit_runtime_status(
                 f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}walk-forward回测超时: model={SHORT_TERM_MODEL_DISPLAY}, "
                 f"reason={adaptive_backtest['reason']}"
             )
-        adaptive_backtest_health = _evaluate_adaptive_backtest_health(adaptive_backtest)
+        adaptive_backtest_health = _evaluate_adaptive_backtest_health(
+            adaptive_backtest,
+            strategy_type=ADAPTIVE_STRATEGY_TYPE,
+        )
         adaptive_health = _combine_adaptive_health(adaptive_signal_health, adaptive_backtest_health)
         _emit_runtime_status(
             f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}判定: model={SHORT_TERM_MODEL_DISPLAY}, enabled={adaptive_health.get('enabled')}, "

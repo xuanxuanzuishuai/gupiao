@@ -69,7 +69,9 @@ ADAPTIVE_SIGNAL_HEALTH = {
     "min_trade_win_rate": 55.0,
     "min_evaluated_trades": 8,
 }
-ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS = 120
+SHORT_TERM_ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS = 90
+LONG_RUNWAY_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS = 120
+ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS = SHORT_TERM_ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS
 ADAPTIVE_PERSIST_BACKTEST_TIMEOUT_SECONDS = 45 * 60
 ADAPTIVE_BACKTEST_HEALTH = {
     "hold_days": 10,
@@ -77,6 +79,13 @@ ADAPTIVE_BACKTEST_HEALTH = {
     "min_avg_top_return": 2.0,
     "min_avg_top_win_rate": 54.5,
     "min_excess_return": 0.5,
+}
+LONG_RUNWAY_BACKTEST_HEALTH = {
+    "hold_days": 120,
+    "min_evaluated_days": 5,
+    "min_avg_top_return": 8.0,
+    "min_avg_top_win_rate": 50.0,
+    "min_excess_return": 2.0,
 }
 ADAPTIVE_HEALTH_POLICIES = {
     "confirmed": {
@@ -112,7 +121,7 @@ ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS = max(
     int(ADAPTIVE_RISK_CONTEXT_TRADE_DAYS),
 )
 ADAPTIVE_BACKTEST_CONTEXT_TRADE_DAYS = (
-    int(ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS)
+    int(SHORT_TERM_ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS)
     + int(ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS)
 )
 LONG_RUNWAY_ROLLING_CONTEXT_TRADE_DAYS = 260
@@ -191,6 +200,18 @@ ADAPTIVE_STRATEGY_LABEL = f"{SHORT_TERM_MODEL_LABEL}策略"
 LONG_RUNWAY_STRATEGY_TYPE = "long_runway"
 LONG_RUNWAY_STRATEGY_LABEL = f"{LONG_RUNWAY_MODEL_LABEL}中长期跟踪"
 LEGACY_ADAPTIVE_STRATEGY_TYPES = ("自适应模型策略",)
+ADAPTIVE_BACKTEST_HEALTH_PROFILES = {
+    ADAPTIVE_STRATEGY_TYPE: {
+        "label": SHORT_TERM_MODEL_DISPLAY,
+        "lookback_trade_days": SHORT_TERM_ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS,
+        "settings": ADAPTIVE_BACKTEST_HEALTH,
+    },
+    LONG_RUNWAY_STRATEGY_TYPE: {
+        "label": LONG_RUNWAY_MODEL_DISPLAY,
+        "lookback_trade_days": LONG_RUNWAY_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS,
+        "settings": LONG_RUNWAY_BACKTEST_HEALTH,
+    },
+}
 RECOMMENDATION_TIER_FORMAL = "正式推荐"
 RECOMMENDATION_TIER_OBSERVE = "观察候选"
 RECOMMENDATION_TIER_RESEARCH = "研究价值"
@@ -1789,16 +1810,44 @@ def _load_adaptive_signal_health(reference_date):
     }
 
 
-def _evaluate_adaptive_backtest_health(backtest_result):
-    settings = ADAPTIVE_BACKTEST_HEALTH
+def _adaptive_backtest_health_profile(strategy_type=None):
+    strategy_type = strategy_type or ADAPTIVE_STRATEGY_TYPE
+    return (
+        ADAPTIVE_BACKTEST_HEALTH_PROFILES.get(strategy_type)
+        or ADAPTIVE_BACKTEST_HEALTH_PROFILES[ADAPTIVE_STRATEGY_TYPE]
+    )
+
+
+def _adaptive_backtest_health_settings(strategy_type=None):
+    return dict(_adaptive_backtest_health_profile(strategy_type).get("settings") or ADAPTIVE_BACKTEST_HEALTH)
+
+
+def _adaptive_backtest_health_lookback_trade_days(strategy_type=None):
+    profile = _adaptive_backtest_health_profile(strategy_type)
+    return int(profile.get("lookback_trade_days") or ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS)
+
+
+def _adaptive_backtest_context_trade_days(strategy_type=None):
+    return (
+        int(_adaptive_backtest_health_lookback_trade_days(strategy_type))
+        + int(ADAPTIVE_DAILY_DECISION_CONTEXT_TRADE_DAYS)
+    )
+
+
+def _evaluate_adaptive_backtest_health(backtest_result, strategy_type=None):
+    profile = _adaptive_backtest_health_profile(strategy_type)
+    settings = _adaptive_backtest_health_settings(strategy_type)
     hold_days = int(settings["hold_days"])
+    window_trade_days = _adaptive_backtest_health_lookback_trade_days(strategy_type)
     if not backtest_result or backtest_result.get("success") is False:
         reason = (backtest_result or {}).get("reason") or "backtest_failed"
         return {
             "enabled": False,
             "mode": "walk_forward_backtest",
+            "strategy_type": strategy_type or ADAPTIVE_STRATEGY_TYPE,
+            "strategy_label": profile.get("label"),
             "hold_days": hold_days,
-            "window_trade_days": int(ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS),
+            "window_trade_days": window_trade_days,
             "evaluated_days": 0,
             "avg_top_return": None,
             "avg_top_win_rate": None,
@@ -1830,8 +1879,10 @@ def _evaluate_adaptive_backtest_health(backtest_result):
     return {
         "enabled": not failure_reasons,
         "mode": "walk_forward_backtest",
+        "strategy_type": strategy_type or ADAPTIVE_STRATEGY_TYPE,
+        "strategy_label": profile.get("label"),
         "hold_days": hold_days,
-        "window_trade_days": int(ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS),
+        "window_trade_days": window_trade_days,
         "evaluated_days": evaluated_days,
         "avg_top_return": _round_or_none(avg_top_return, 4),
         "avg_top_win_rate": _round_or_none(avg_top_win_rate, 2),

@@ -90,7 +90,11 @@ def _build_adaptive_validation_note(health_snapshot):
     backtest_health = health_snapshot.get("backtest_health") or {}
 
     signal_window = int(ADAPTIVE_SIGNAL_HEALTH_LOOKBACK_TRADE_DAYS)
-    backtest_window = int(ADAPTIVE_BACKTEST_HEALTH_LOOKBACK_TRADE_DAYS)
+    backtest_settings = _adaptive_backtest_health_settings(ADAPTIVE_STRATEGY_TYPE)
+    backtest_window = int(
+        backtest_health.get("window_trade_days")
+        or _adaptive_backtest_health_lookback_trade_days(ADAPTIVE_STRATEGY_TYPE)
+    )
 
     if mode == "confirmed":
         parts = [
@@ -100,7 +104,7 @@ def _build_adaptive_validation_note(health_snapshot):
                 f"{signal_health.get('avg_return')}%/{signal_health.get('trade_win_rate')}%"
             ),
             (
-                f"{backtest_window}日walk-forward{backtest_health.get('hold_days') or ADAPTIVE_BACKTEST_HEALTH['hold_days']}日"
+                f"{backtest_window}日walk-forward{backtest_health.get('hold_days') or backtest_settings['hold_days']}日"
                 f"{backtest_health.get('avg_top_return')}%/超额{backtest_health.get('excess_return')}%"
             ),
         ]
@@ -114,7 +118,7 @@ def _build_adaptive_validation_note(health_snapshot):
             f"{signal_window}日实盘样本未满{ADAPTIVE_SIGNAL_HEALTH['min_evaluated_trades']}笔",
             (
                 f"先按{backtest_window}日walk-forward"
-                f"{backtest_health.get('hold_days') or ADAPTIVE_BACKTEST_HEALTH['hold_days']}日"
+                f"{backtest_health.get('hold_days') or backtest_settings['hold_days']}日"
                 f"{backtest_health.get('avg_top_return')}%/超额{backtest_health.get('excess_return')}%"
             ),
         ]
