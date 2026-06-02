@@ -18,7 +18,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 
 import akshare as ak
 import pandas as pd
-import pymysql
 
 import func
 
@@ -113,19 +112,6 @@ A_SHARE_CODE_PREFIXES = (
     "689",
     "920",
 )
-A_SHARE_DATA_TABLES = (
-    "a_stock_analysis",
-    "a_stock_analysis_history",
-    "a_stock_strategy_result",
-    "a_stock_risk_overlay",
-)
-DB_CONFIG = {
-    "host": "127.0.0.1",
-    "user": "root",
-    "password": "rootroot",
-    "database": "gu_piao",
-    "charset": "utf8mb4",
-}
 
 
 def _normalize_stock_code(value):
@@ -706,77 +692,6 @@ def _upsert_stocks(stock_df):
     return stats
 
 
-def _quote_identifier(identifier):
-    if not re.fullmatch(r"[A-Za-z0-9_]+", str(identifier)):
-        raise ValueError(f"非法SQL标识符: {identifier}")
-    return f"`{identifier}`"
-
-
-def _existing_stock_code_tables(connection):
-    placeholders = ",".join(["%s"] * len(A_SHARE_DATA_TABLES))
-    sql = f"""
-        SELECT table_name
-        FROM information_schema.columns
-        WHERE table_schema = %s
-          AND column_name = 'stock_code'
-          AND table_name IN ({placeholders})
-        ORDER BY table_name
-    """
-    params = [DB_CONFIG["database"], *A_SHARE_DATA_TABLES]
-
-    with connection.cursor() as cursor:
-        cursor.execute(sql, params)
-        return [row[0] for row in cursor.fetchall()]
-
-
-def _cleanup_non_current_a_share_records(valid_stock_codes):
-    valid_codes = sorted(
-        {
-            _normalize_stock_code(stock_code)
-            for stock_code in valid_stock_codes
-            if _is_a_share_stock_code(stock_code)
-        }
-    )
-    if not valid_codes:
-        raise ValueError("当前A股股票池为空，拒绝执行数据库清理")
-
-    connection = None
-    cleanup_stats = {}
-    placeholders = ",".join(["%s"] * len(valid_codes))
-    stock_code_expr = "TRIM(CAST(stock_code AS CHAR))"
-    where_clause = (
-        f"stock_code IS NULL OR {stock_code_expr} = '' "
-        f"OR {stock_code_expr} NOT IN ({placeholders})"
-    )
-
-    try:
-        connection = pymysql.connect(**DB_CONFIG)
-        tables = _existing_stock_code_tables(connection)
-        with connection.cursor() as cursor:
-            for table_name in tables:
-                quoted_table = _quote_identifier(table_name)
-                count_sql = f"SELECT COUNT(*) FROM {quoted_table} WHERE {where_clause}"
-                cursor.execute(count_sql, valid_codes)
-                delete_count = int(cursor.fetchone()[0] or 0)
-
-                if delete_count:
-                    delete_sql = f"DELETE FROM {quoted_table} WHERE {where_clause}"
-                    cursor.execute(delete_sql, valid_codes)
-
-                cleanup_stats[table_name] = delete_count
-
-        connection.commit()
-        func.logInfo(f"非当前A股数据清理完成: {cleanup_stats}")
-        return cleanup_stats
-    except Exception:
-        if connection:
-            connection.rollback()
-        raise
-    finally:
-        if connection:
-            connection.close()
-
-
 def get_gu_piao_code_and_name():
     func.logInfo("开始抓取A股有哪些股票（多源并行）")
     stock_universe_df = _fetch_stock_universe_parallel()
@@ -792,7 +707,6 @@ def get_gu_piao_code_and_name():
 
     stock_universe_df = stock_universe_df.drop_duplicates(subset=["stock_code"], keep="first").reset_index(drop=True)
     upsert_stats = _upsert_stocks(stock_universe_df)
-    cleanup_stats = _cleanup_non_current_a_share_records(stock_universe_df["stock_code"].tolist())
 
     summary = {
         "universe_count": int(len(stock_universe_df)),
@@ -801,7 +715,6 @@ def get_gu_piao_code_and_name():
         "updated": upsert_stats["updated"],
         "unchanged": upsert_stats["unchanged"],
         "failed": upsert_stats["failed"],
-        "deleted_non_current_a_share": cleanup_stats,
     }
     func.logInfo(f"抓取A股有哪些股票完毕: {summary}")
     return summary
