@@ -1103,8 +1103,30 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def run_industry_hotspot_analysis(
+    end_date=None,
+    lookback_trade_days=15,
+    min_stock_count=3,
+    limit=30,
+    rising_limit=15,
+    leader_count=3,
+    review_trade_days=35,
+    review_min_samples=8,
+    output=None,
+    print_report=True,
+):
+    args = argparse.Namespace(
+        end_date=end_date,
+        lookback_trade_days=lookback_trade_days,
+        min_stock_count=min_stock_count,
+        limit=limit,
+        rising_limit=rising_limit,
+        leader_count=leader_count,
+        review_trade_days=review_trade_days,
+        review_min_samples=review_min_samples,
+        output=output,
+        save_csv=True,
+    )
     history, trade_dates = load_recent_history(args.lookback_trade_days, args.end_date)
     if history.empty:
         raise RuntimeError("a_stock_analysis_history 没有可分析数据")
@@ -1135,16 +1157,42 @@ def main():
     )
     output_paths = save_outputs(report, board_report, leaders, historical_review, args)
 
-    print(report)
-    print("")
-    print(f"输出目录: {output_paths['daily_dir']}")
-    print(f"报告已保存: {output_paths['report_path']}")
-    print(f"板块明细CSV: {output_paths['board_csv_path']}")
-    print(f"龙头明细CSV: {output_paths['leader_csv_path']}")
-    if output_paths.get("review_csv_path"):
-        print(f"历史复盘CSV: {output_paths['review_csv_path']}")
-    if trade_dates:
-        print(f"实际读取交易日: {trade_dates[0]} 至 {trade_dates[-1]}，共 {len(trade_dates)} 个交易日")
+    if print_report:
+        print(report)
+        print("")
+        print(f"输出目录: {output_paths['daily_dir']}")
+        print(f"报告已保存: {output_paths['report_path']}")
+        print(f"板块明细CSV: {output_paths['board_csv_path']}")
+        print(f"龙头明细CSV: {output_paths['leader_csv_path']}")
+        if output_paths.get("review_csv_path"):
+            print(f"历史复盘CSV: {output_paths['review_csv_path']}")
+        if trade_dates:
+            print(f"实际读取交易日: {trade_dates[0]} 至 {trade_dates[-1]}，共 {len(trade_dates)} 个交易日")
+
+    return {
+        "success": True,
+        "trade_dates": trade_dates,
+        "output_paths": output_paths,
+        "board_count": int(len(board_report)),
+        "leader_count": int(len(leaders)),
+        "history_review_count": int(len(historical_review)) if historical_review is not None else 0,
+    }
+
+
+def main():
+    args = parse_args()
+    return run_industry_hotspot_analysis(
+        end_date=args.end_date,
+        lookback_trade_days=args.lookback_trade_days,
+        min_stock_count=args.min_stock_count,
+        limit=args.limit,
+        rising_limit=args.rising_limit,
+        leader_count=args.leader_count,
+        review_trade_days=args.review_trade_days,
+        review_min_samples=args.review_min_samples,
+        output=args.output,
+        print_report=True,
+    )
 
 
 if __name__ == "__main__":

@@ -9,10 +9,12 @@
     先运行 get_gu_piao_info 抓取行情并确认目标交易日；
     再刷新自适应风险覆盖表，确保策略使用最新风控结果；
     然后运行每日固定策略推荐；
-    最后运行短线自适应模型工作流并按健康验证结果决定是否落库。
+    接着运行短线自适应模型工作流并按健康验证结果决定是否落库；
+    最后输出行业热点、关注上升板块和龙头股报告。
 """
 
 import get_gu_piao_info
+import analysis_industry_hotspot
 import analysis_gu_piao_adaptive_risk_overlay_model as risk_overlay
 from analysis_gu_piao_data_print_result import analysis_gu_piao_data, clear_daily_strategy_results
 from analysis_gu_piao_history_adaptive_model import (
@@ -162,6 +164,19 @@ if __name__ == "__main__":
         include_long_runway=False,
         include_backtest=False,
         persist_strategy_result=True,
+    )
+    industry_hotspot_summary = run_stage(
+        "行业热点资金分析",
+        analysis_industry_hotspot.run_industry_hotspot_analysis,
+        end_date=target_trade_date,
+    )
+    industry_output_paths = (industry_hotspot_summary or {}).get("output_paths") or {}
+    print(
+        "行业热点资金分析: "
+        f"report_path={industry_output_paths.get('report_path') or '--'}, "
+        f"board_csv={industry_output_paths.get('board_csv_path') or '--'}, "
+        f"leader_csv={industry_output_paths.get('leader_csv_path') or '--'}",
+        flush=True,
     )
     # long_runway_summary = run_stage(
     #     f"每日{LONG_RUNWAY_MODEL_DISPLAY}中长期跟踪",
