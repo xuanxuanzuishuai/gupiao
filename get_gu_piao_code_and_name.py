@@ -681,5 +681,5 @@ def get_gu_piao_code_and_name():
 
 
 if __name__ == "__main__":
-    func.remove_path(func.getenv('LOG_PATH'))
+    func.remove_path(func.getenv('LOG_PATH') + "similar_log.txt")
     get_gu_piao_code_and_name()
