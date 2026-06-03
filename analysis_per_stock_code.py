@@ -4015,6 +4015,12 @@ def _build_analysis_result(context, scored, views):
             "fundamental_event_context": target.get("fundamental_event_context"),
             "fundamental_note": target.get("fundamental_note"),
             "event_note": target.get("event_note"),
+            "event_catalyst": target.get("event_catalyst"),
+            "event_catalyst_score": target.get("event_catalyst_score"),
+            "event_catalyst_level": target.get("event_catalyst_level"),
+            "event_catalyst_primary": target.get("event_catalyst_primary"),
+            "event_catalyst_labels": target.get("event_catalyst_labels"),
+            "event_catalyst_note": target.get("event_catalyst_note"),
             "lhb_note": target.get("lhb_note"),
             "unlock_note": target.get("unlock_note"),
         },
@@ -4381,6 +4387,23 @@ def _brief_join(items, limit=3):
     return "；".join(values[:limit]) + f"；另{len(values) - limit}项"
 
 
+def _event_catalyst_text(event_catalyst):
+    if not event_catalyst:
+        return None
+    primary = event_catalyst.get("primary")
+    if not primary:
+        return None
+    level = event_catalyst.get("level") or "--"
+    score = event_catalyst.get("score")
+    score_text = f"，{score}分" if score is not None else ""
+    bits = [f"{primary}({level}{score_text})"]
+    if event_catalyst.get("mechanism"):
+        bits.append(event_catalyst.get("mechanism"))
+    if event_catalyst.get("trade_note"):
+        bits.append(event_catalyst.get("trade_note"))
+    return "；".join(bits)
+
+
 def _compact_level_text(items, limit=2):
     values = []
     for item in items or []:
@@ -4472,6 +4495,8 @@ def _print_execution_report(result):
     execution_context = realtime.get("execution_context") or {}
     has_trade_context = bool(execution_context.get("has_trade_context") or levels.get("has_trade_context"))
     holding_metrics = realtime.get("holding_metrics") or {}
+    overlay = result.get("risk_overlay") or {}
+    event_catalyst_text = _event_catalyst_text(overlay.get("event_catalyst"))
     memory_summary = ((result.get("strategy_memory_review") or {}).get("summary") or {})
     evidence_grade = professional_view.get("evidence_grade")
 
@@ -4570,6 +4595,8 @@ def _print_execution_report(result):
             f"- 评分构成: {score_text}；"
             f"合计{_as_text(scorecard.get('score'), '分')} -> {scorecard.get('rating') or '--'}。"
         )
+    if event_catalyst_text:
+        print(f"- 事件催化: {event_catalyst_text}")
     if realtime.get("success"):
         tape_grade = day_tape.get("grade") or "--"
         if isinstance(tape_grade, str) and tape_grade.startswith("盘中"):
@@ -4925,6 +4952,7 @@ def _print_detail_report(result):
     )
     print(f"- 财务: {overlay.get('fundamental_note') or '--'}")
     print(f"- 公告: {overlay.get('event_note') or '--'}")
+    print(f"- 事件催化: {_event_catalyst_text(overlay.get('event_catalyst')) or '--'}")
     print(f"- 龙虎榜: {overlay.get('lhb_note') or '--'}")
     print(f"- 解禁: {overlay.get('unlock_note') or '--'}")
     print()
