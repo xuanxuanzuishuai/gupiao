@@ -86,6 +86,77 @@ SPECIAL_POOL_LABELS = {
 EXTERNAL_FORCE_DOWNGRADE_LABELS = {"减持", "大比例解禁", "近端超大比例解禁"}
 BOOL_TRUE_TEXTS = {"1", "true", "t", "yes", "y", "on", "是", "真"}
 BOOL_FALSE_TEXTS = {"", "0", "false", "f", "no", "n", "off", "否", "假", "none", "null", "nan"}
+EVENT_CATALYST_PATTERNS = [
+    {
+        "label": "重组/资产注入",
+        "score": 5.5,
+        "keywords": [
+            "筹划重大资产重组",
+            "重大资产重组",
+            "发行股份购买资产",
+            "资产注入",
+            "资产置换",
+            "资产重组",
+            "控制权变更",
+            "实控人变更",
+            "国资整合",
+        ],
+        "skip_phrases": ["不构成重大资产重组", "终止重大资产重组", "终止筹划重大资产重组"],
+        "mechanism": "资产质量、盈利边界或控制权预期发生变化，容易触发估值重估和事件博弈",
+        "trade_note": "按事件股处理，连续涨停后重点看开板换手和公告进展，不按普通行业趋势票追高",
+    },
+    {
+        "label": "并购/资产交易",
+        "score": 3.2,
+        "keywords": ["购买资产", "出售资产", "收购", "并购", "股权转让", "股权收购", "控股权", "增资"],
+        "skip_phrases": ["终止收购", "终止购买资产", "终止出售资产"],
+        "mechanism": "资产结构或业务组合变化，市场会提前交易协同、利润增厚或壳/平台价值",
+        "trade_note": "需要区分是否增厚主业，若只是关联交易或小额资产处置，强度要打折",
+    },
+    {
+        "label": "产能释放",
+        "score": 3.0,
+        "keywords": ["试生产", "投产", "竣工投产", "扩建项目", "产能", "生产线", "量产"],
+        "skip_phrases": ["延期", "停产", "终止"],
+        "mechanism": "新增产能会带来收入弹性，但最终取决于价格、订单和爬坡节奏",
+        "trade_note": "看行业价格和订单能否承接产能，放量冲高后若板块不共振容易兑现",
+    },
+    {
+        "label": "价格传导",
+        "score": 2.8,
+        "keywords": ["涨价", "提价", "价格上调", "报价上调", "产品价格"],
+        "mechanism": "产品价格改善会直接改善毛利率预期，周期品短线弹性通常来自价差扩张",
+        "trade_note": "价格催化要看是否全行业持续涨价，单日脉冲后需防止预期兑现",
+    },
+    {
+        "label": "业绩修复",
+        "score": 2.8,
+        "keywords": ["预增", "扭亏", "业绩增长", "业绩快报", "净利润增长", "盈利能力提升"],
+        "mechanism": "盈利修复会改善估值锚，若同时伴随行业景气上行，持续性更强",
+        "trade_note": "业绩票更适合等回踩确认，短线急拉后要看估值和同比基数",
+    },
+    {
+        "label": "订单/合同",
+        "score": 2.4,
+        "keywords": ["中标", "签订合同", "重大合同", "订单", "供货协议", "采购协议"],
+        "mechanism": "订单提升收入可见度，若合同金额占营收比例高，股价弹性更明显",
+        "trade_note": "重点看合同金额、毛利率和履约周期，小合同不应给太高权重",
+    },
+    {
+        "label": "资本信号",
+        "score": 1.8,
+        "keywords": ["回购", "增持", "员工持股", "股权激励", "分红"],
+        "mechanism": "回购、增持和激励释放管理层信心，但通常不是最强主升催化",
+        "trade_note": "可作为底部信号或情绪加分，不能替代趋势和成交确认",
+    },
+    {
+        "label": "战略合作/题材",
+        "score": 2.0,
+        "keywords": ["战略合作", "战略入股", "人工智能", "AI", "机器人", "算力", "芯片", "低空经济", "IP"],
+        "mechanism": "题材合作会提升想象空间，短线弹性大，但兑现路径和收入贡献常不确定",
+        "trade_note": "先按题材催化观察，只有订单、收入或资产注入落地后才提高持续性判断",
+    },
+]
 
 
 def _normalize_stock_code(value):
@@ -94,6 +165,85 @@ def _normalize_stock_code(value):
     text = str(value).strip()
     matched = re.search(r"(\d{6})", text)
     return matched.group(1) if matched else None
+
+
+def _text_contains_keyword(text, keyword):
+    if not text or not keyword:
+        return False
+    text = str(text)
+    keyword = str(keyword)
+    if re.search(r"[A-Za-z]", keyword):
+        return keyword.lower() in text.lower()
+    return keyword in text
+
+
+def _match_event_catalysts(text):
+    matches = []
+    for pattern in EVENT_CATALYST_PATTERNS:
+        if any(_text_contains_keyword(text, phrase) for phrase in pattern.get("skip_phrases") or []):
+            continue
+        matched_keywords = [
+            keyword
+            for keyword in pattern.get("keywords") or []
+            if _text_contains_keyword(text, keyword)
+        ]
+        if not matched_keywords:
+            continue
+        matches.append(
+            {
+                "label": pattern["label"],
+                "score": pattern["score"],
+                "keywords": matched_keywords[:4],
+                "mechanism": pattern["mechanism"],
+                "trade_note": pattern["trade_note"],
+            }
+        )
+    return matches
+
+
+def _event_catalyst_level(score):
+    score = _to_float(score) or 0.0
+    if score >= 5:
+        return "强"
+    if score >= 3:
+        return "中"
+    if score > 0:
+        return "弱"
+    return "无"
+
+
+def _build_event_catalyst_summary(catalyst_hits, catalyst_score):
+    if not catalyst_hits:
+        return {
+            "score": 0.0,
+            "level": "无",
+            "labels": [],
+            "primary": None,
+            "mechanism": "",
+            "trade_note": "",
+            "note": "未识别出明确金融催化。",
+            "items": [],
+        }
+
+    primary = max(catalyst_hits, key=lambda item: _to_float(item.get("score")) or 0.0)
+    labels = list(dict.fromkeys(item.get("label") for item in catalyst_hits if item.get("label")))
+    score = _round_or_none(min(catalyst_score, 12.0), 2) or 0.0
+    level = _event_catalyst_level(score)
+    note = (
+        f"{level}催化:{primary.get('label') or '--'}；"
+        f"{primary.get('mechanism') or '--'}；"
+        f"{primary.get('trade_note') or '--'}"
+    )
+    return {
+        "score": score,
+        "level": level,
+        "labels": labels[:8],
+        "primary": primary.get("label"),
+        "mechanism": primary.get("mechanism"),
+        "trade_note": primary.get("trade_note"),
+        "note": note,
+        "items": catalyst_hits[:8],
+    }
 
 
 def _to_date_text(value):
@@ -810,6 +960,7 @@ def _extract_recent_events(ak, stock_code, trade_date=None, lookback_days=DEFAUL
         "labels": [],
         "note": "公告数据未获取。",
         "recent_items": [],
+        "event_catalyst": _build_event_catalyst_summary([], 0.0),
     }
     end_ts = _resolve_notice_query_end_date(trade_date)
     begin_ts = end_ts - pd.Timedelta(days=int(lookback_days or DEFAULT_EVENT_LOOKBACK_DAYS))
@@ -836,9 +987,15 @@ def _extract_recent_events(ak, stock_code, trade_date=None, lookback_days=DEFAUL
     labels = []
     risk_score = 0.0
     positive_score = 0.0
+    catalyst_hits = []
+    catalyst_score = 0.0
     block_formal = False
 
     risk_patterns = [
+        ("终止重大资产重组", 6.0, True),
+        ("终止筹划重大资产重组", 6.0, True),
+        ("终止收购", 4.0, False),
+        ("终止购买资产", 4.0, False),
         ("严重异常波动", 6.0, True),
         ("异常波动", 3.0, False),
         ("停牌核查", 5.0, True),
@@ -872,14 +1029,12 @@ def _extract_recent_events(ak, stock_code, trade_date=None, lookback_days=DEFAUL
         title = str(row.get(title_col) or "")
         event_type = str(row.get(type_col) or "") if type_col else ""
         item_date = _to_date_text(row.get(date_col)) if date_col else None
-        rows.append(
-            {
-                "date": item_date,
-                "type": event_type,
-                "title": title,
-                "url": row.get(url_col) if url_col else None,
-            }
-        )
+        item = {
+            "date": item_date,
+            "type": event_type,
+            "title": title,
+            "url": row.get(url_col) if url_col else None,
+        }
         text = f"{title} {event_type}"
         for keyword, score, hard_block in risk_patterns:
             if keyword in text:
@@ -889,8 +1044,23 @@ def _extract_recent_events(ak, stock_code, trade_date=None, lookback_days=DEFAUL
         for keyword, score in positive_patterns:
             if keyword in text:
                 positive_score += score
+        matched_catalysts = _match_event_catalysts(text)
+        if matched_catalysts:
+            item["catalysts"] = [match.get("label") for match in matched_catalysts if match.get("label")]
+            for match in matched_catalysts:
+                catalyst_score += _to_float(match.get("score")) or 0.0
+                catalyst_hits.append(
+                    {
+                        **match,
+                        "date": item_date,
+                        "title": title,
+                        "type": event_type,
+                    }
+                )
+        rows.append(item)
 
     labels = list(dict.fromkeys(labels))
+    catalyst_summary = _build_event_catalyst_summary(catalyst_hits, catalyst_score)
     note = f"近{lookback_days}日公告{len(data)}条"
     if rows:
         note += f"；最新:{rows[0].get('date') or '--'} {rows[0].get('title') or '--'}"
@@ -898,16 +1068,24 @@ def _extract_recent_events(ak, stock_code, trade_date=None, lookback_days=DEFAUL
         note += f"；事件提示:{'、'.join(labels[:5])}"
     else:
         note += "；未识别出硬风险公告关键词"
+    if catalyst_summary.get("primary"):
+        note += f"；金融催化:{catalyst_summary.get('level')}/{catalyst_summary.get('primary')}"
 
     context.update(
         {
             "status": "ok",
             "risk_score": _round_or_none(min(risk_score, 20.0), 2),
-            "positive_score": _round_or_none(min(positive_score, 8.0), 2),
+            "positive_score": _round_or_none(min(positive_score + catalyst_summary.get("score", 0.0), 12.0), 2),
             "block_formal": bool(block_formal),
             "labels": labels[:8],
             "note": note,
             "recent_items": rows,
+            "event_catalyst": catalyst_summary,
+            "catalyst_score": catalyst_summary.get("score"),
+            "catalyst_level": catalyst_summary.get("level"),
+            "catalyst_labels": catalyst_summary.get("labels"),
+            "primary_catalyst": catalyst_summary.get("primary"),
+            "catalyst_note": catalyst_summary.get("note"),
         }
     )
     return context
@@ -1138,6 +1316,7 @@ def fetch_external_stock_context(
         labels.extend(item.get("labels") or [])
     labels = list(dict.fromkeys(labels))
     block_formal = any(_normalize_bool(item.get("block_formal")) for item in [fundamental, events, lhb, unlock])
+    event_catalyst = events.get("event_catalyst") or _build_event_catalyst_summary([], 0.0)
 
     notes = [note for note in [info_note, fundamental.get("note"), events.get("note"), lhb.get("note"), unlock.get("note")] if note]
     return {
@@ -1152,6 +1331,7 @@ def fetch_external_stock_context(
         "valuation": valuation,
         "fundamental": fundamental,
         "events": events,
+        "event_catalyst": event_catalyst,
         "lhb": lhb,
         "unlock": unlock,
     }
@@ -1203,9 +1383,16 @@ def _merge_external_context(row, external_context):
         row["risk_overlay_action"] = "不进入普通正式推荐，降级观察并等待事件供给压力释放"
     else:
         row["risk_overlay_action"] = row.get("risk_overlay_action") or "可按普通策略继续评估"
+    event_catalyst = external_context.get("event_catalyst") or _build_event_catalyst_summary([], 0.0)
     row["fundamental_event_context"] = external_context
     row["fundamental_note"] = (external_context.get("fundamental") or {}).get("note")
     row["event_note"] = (external_context.get("events") or {}).get("note")
+    row["event_catalyst"] = event_catalyst
+    row["event_catalyst_score"] = event_catalyst.get("score")
+    row["event_catalyst_level"] = event_catalyst.get("level")
+    row["event_catalyst_primary"] = event_catalyst.get("primary")
+    row["event_catalyst_labels"] = "、".join(event_catalyst.get("labels") or [])
+    row["event_catalyst_note"] = event_catalyst.get("note")
     row["lhb_note"] = (external_context.get("lhb") or {}).get("note")
     row["unlock_note"] = (external_context.get("unlock") or {}).get("note")
     base_note_parts = [

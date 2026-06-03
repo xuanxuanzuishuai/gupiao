@@ -1,0 +1,1773 @@
+"""盘中关注池分析。
+
+作用:
+    读取近20个交易日的策略落库结果和上一完整交易日行业热点报告，
+    同时比较近几日行业热点延续性，盘中拉取实时行情，
+    输出今天值得关注、只观察或应回避的个股。它只做临时判断，不写入
+    a_stock_analysis_history，避免污染收盘模型和回测。
+
+流程:
+    先确定上一完整交易日；
+    再读取 a_stock_strategy_result 和 log/industry_hotspot/YYYY-MM-DD；
+    然后批量请求 Sina 实时行情；
+    最后按策略来源、行业热度、龙头身份和盘中承接状态综合排序。
+"""
+
+import argparse
+import datetime as dt
+import json
+import math
+import re
+from pathlib import Path
+
+import pandas as pd
+import pymysql
+import requests
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+INTRADAY_REPORT_DIR = PROJECT_ROOT / "log" / "intraday_focus"
+SINA_REALTIME_URL = "https://hq.sinajs.cn/list={symbols}"
+SINA_HEADERS = {
+    "Referer": "https://finance.sina.com.cn",
+    "User-Agent": "Mozilla/5.0",
+}
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "user": "root",
+    "password": "rootroot",
+    "database": "gu_piao",
+    "charset": "utf8mb4",
+}
+HOT_VERSION_SCORE = {
+    "主线热点": 18,
+    "强势热点": 15,
+    "观察": 7,
+}
+LEADER_TYPE_SCORE = {
+    "涨停龙头": 16,
+    "容量中军": 11,
+    "弹性领涨": 10,
+    "放量趋势": 9,
+    "观察核心": 5,
+}
+DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS = 20
+DEFAULT_INDUSTRY_REVIEW_DAYS = 5
+
+
+def _date_text(value):
+    if value is None or pd.isna(value):
+        return None
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        return text[:10]
+    if re.match(r"^\d{8}$", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text or None
+
+
+def _parse_date(value):
+    text = _date_text(value)
+    if not text:
+        return None
+    try:
+        return dt.datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _to_float(value):
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip().replace("%", "").replace(",", "")
+    if not text or text.lower() in {"nan", "none", "null", "--"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _round(value, digits=2):
+    value = _to_float(value)
+    if value is None:
+        return None
+    return round(value, digits)
+
+
+def _normalize_code(value):
+    text = str(value or "").strip()
+    matched = re.search(r"(\d{6})", text)
+    return matched.group(1) if matched else None
+
+
+def _realtime_symbol(stock_code):
+    code = _normalize_code(stock_code)
+    if not code:
+        return None
+    if code.startswith(("920", "8", "4")):
+        return f"bj{code}"
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+def _connect():
+    return pymysql.connect(**DB_CONFIG)
+
+
+def _query_frame(sql, params=None):
+    connection = _connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params or [])
+            rows = cursor.fetchall()
+            columns = [column[0] for column in cursor.description or []]
+        return pd.DataFrame(list(rows), columns=columns)
+    finally:
+        connection.close()
+
+
+def _latest_history_date(before_today=True):
+    today = dt.date.today().strftime("%Y-%m-%d")
+    where = "WHERE CHAR_LENGTH(last_data_date) = 10 AND last_data_date BETWEEN '2000-01-01' AND '2100-12-31'"
+    params = []
+    if before_today:
+        where += " AND last_data_date < %s"
+        params.append(today)
+    frame = _query_frame(
+        f"""
+        SELECT MAX(last_data_date) AS trade_date
+        FROM a_stock_analysis_history
+        {where}
+        """,
+        params,
+    )
+    if frame.empty:
+        return None
+    return _date_text(frame["trade_date"].iloc[0])
+
+
+def _latest_strategy_date(max_date):
+    frame = _query_frame(
+        """
+        SELECT MAX(trade_date) AS trade_date
+        FROM a_stock_strategy_result
+        WHERE trade_date <= %s
+        """,
+        [_date_text(max_date)],
+    )
+    if frame.empty:
+        return None
+    return _date_text(frame["trade_date"].iloc[0])
+
+
+def _recent_history_trade_dates(max_date, lookback_trade_days=DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS):
+    max_date = _date_text(max_date)
+    if not max_date:
+        return []
+    frame = _query_frame(
+        """
+        SELECT last_data_date
+        FROM (
+            SELECT DISTINCT last_data_date
+            FROM a_stock_analysis_history
+            WHERE CHAR_LENGTH(last_data_date) = 10
+              AND last_data_date BETWEEN '2000-01-01' AND '2100-12-31'
+              AND last_data_date <= %s
+            ORDER BY last_data_date DESC
+            LIMIT %s
+        ) recent_days
+        ORDER BY last_data_date
+        """,
+        [max_date, int(lookback_trade_days or DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS)],
+    )
+    if frame.empty:
+        return []
+    return [_date_text(value) for value in frame["last_data_date"].tolist() if _date_text(value)]
+
+
+def _extract_stop_price(strategy_note):
+    text = str(strategy_note or "")
+    patterns = [
+        r"防守[:：]\s*([0-9]+(?:\.[0-9]+)?)",
+        r"跌破([0-9]+(?:\.[0-9]+)?)附近",
+        r"跌破或不能收回\s*([0-9]+(?:\.[0-9]+)?)",
+    ]
+    for pattern in patterns:
+        matched = re.search(pattern, text)
+        if matched:
+            return _round(matched.group(1), 2)
+    return None
+
+
+def _strategy_age_map(strategy_dates):
+    latest_first = list(reversed([_date_text(value) for value in strategy_dates if _date_text(value)]))
+    return {date_value: idx for idx, date_value in enumerate(latest_first)}
+
+
+def _load_strategy_candidates(
+    strategy_date=None,
+    target_trade_date=None,
+    lookback_trade_days=DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS,
+):
+    if strategy_date:
+        strategy_dates = [_date_text(strategy_date)]
+    else:
+        strategy_dates = _recent_history_trade_dates(target_trade_date, lookback_trade_days=lookback_trade_days)
+    strategy_dates = [date_value for date_value in strategy_dates if date_value]
+    if not strategy_dates:
+        return pd.DataFrame()
+    placeholders = ", ".join(["%s"] * len(strategy_dates))
+    frame = _query_frame(
+        f"""
+        SELECT
+            s.trade_date,
+            s.strategy_type,
+            s.stock_code,
+            s.stock_name,
+            s.today_change AS strategy_today_change,
+            s.industry,
+            s.today_amount AS strategy_today_amount,
+            s.turnover_rate AS strategy_turnover_rate,
+            s.strategy_note,
+            h.latest_price AS ref_close,
+            h.today_open AS ref_open,
+            h.today_high AS ref_high,
+            h.today_low AS ref_low,
+            h.ma5,
+            h.ma10,
+            h.ma20,
+            h.amount_avg_5d,
+            h.turnover_avg_5d
+        FROM a_stock_strategy_result s
+        LEFT JOIN a_stock_analysis_history h
+         ON h.stock_code COLLATE utf8mb4_general_ci = s.stock_code COLLATE utf8mb4_general_ci
+         AND h.last_data_date REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+         AND h.last_data_date COLLATE utf8mb4_general_ci = CAST(s.trade_date AS CHAR) COLLATE utf8mb4_general_ci
+        WHERE s.trade_date IN ({placeholders})
+        ORDER BY s.trade_date DESC, s.strategy_type, s.id
+        """,
+        strategy_dates,
+    )
+    if frame.empty:
+        return frame
+    frame["stock_code"] = frame["stock_code"].apply(_normalize_code)
+    frame["stop_price"] = frame["strategy_note"].apply(_extract_stop_price)
+    age_map = _strategy_age_map(strategy_dates)
+    frame["strategy_date_text"] = frame["trade_date"].apply(_date_text)
+    frame["strategy_age_trade_days"] = frame["strategy_date_text"].map(age_map)
+    return frame
+
+
+def _industry_dir_for_date(trade_date):
+    wanted = _parse_date(trade_date)
+    root = PROJECT_ROOT / "log" / "industry_hotspot"
+    if not root.exists():
+        return None
+    dirs = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        parsed = _parse_date(child.name)
+        if not parsed:
+            continue
+        if wanted and parsed > wanted:
+            continue
+        dirs.append((parsed, child))
+    if not dirs:
+        return None
+    return sorted(dirs, key=lambda item: item[0])[-1][1]
+
+
+def _default_industry_date():
+    return (dt.date.today() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _recent_industry_dirs(end_date, review_days=DEFAULT_INDUSTRY_REVIEW_DAYS):
+    wanted = _parse_date(end_date)
+    root = PROJECT_ROOT / "log" / "industry_hotspot"
+    if not root.exists():
+        return []
+    dirs = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        parsed = _parse_date(child.name)
+        if not parsed:
+            continue
+        if wanted and parsed > wanted:
+            continue
+        dirs.append((parsed, child))
+    dirs = sorted(dirs, key=lambda item: item[0], reverse=True)[: int(review_days or DEFAULT_INDUSTRY_REVIEW_DAYS)]
+    return [child for _, child in sorted(dirs, key=lambda item: item[0])]
+
+
+def _read_csv_if_exists(path):
+    if not path or not Path(path).exists():
+        return pd.DataFrame()
+    return pd.read_csv(path, encoding="utf-8-sig")
+
+
+def _load_industry_reports(trade_date):
+    daily_dir = _industry_dir_for_date(trade_date)
+    if not daily_dir:
+        return daily_dir, pd.DataFrame(), pd.DataFrame()
+    boards = _read_csv_if_exists(daily_dir / "industry_hotspot_boards.csv")
+    leaders = _read_csv_if_exists(daily_dir / "industry_hotspot_leaders.csv")
+    return daily_dir, boards, leaders
+
+
+def _load_industry_review(end_date, review_days=DEFAULT_INDUSTRY_REVIEW_DAYS):
+    review_dirs = _recent_industry_dirs(end_date, review_days=review_days)
+    board_frames = []
+    leader_frames = []
+    for daily_dir in review_dirs:
+        boards = _read_csv_if_exists(daily_dir / "industry_hotspot_boards.csv")
+        leaders = _read_csv_if_exists(daily_dir / "industry_hotspot_leaders.csv")
+        if not boards.empty:
+            boards = boards.copy()
+            boards["_review_date"] = daily_dir.name
+            boards["_board_name"] = boards.apply(_board_name, axis=1)
+            board_frames.append(boards)
+        if not leaders.empty:
+            leaders = leaders.copy()
+            leaders["_review_date"] = daily_dir.name
+            leaders["股票代码"] = leaders["股票代码"].apply(_normalize_code)
+            leader_frames.append(leaders)
+    boards = pd.concat(board_frames, ignore_index=True) if board_frames else pd.DataFrame()
+    leaders = pd.concat(leader_frames, ignore_index=True) if leader_frames else pd.DataFrame()
+    return review_dirs, boards, leaders
+
+
+def _board_name(row):
+    if row is None:
+        return ""
+    return str(row.get("板块名称") or row.get("industry_name") or "").strip()
+
+
+def _is_focus_board(row):
+    hot_rank = _to_float(row.get("热点排名") or row.get("hot_rank"))
+    attention_rank = _to_float(row.get("关注排名") or row.get("attention_rank"))
+    version = str(row.get("热点版本") or "")
+    advice = str(row.get("参与建议") or "")
+    if "回避" in advice:
+        return False
+    if version in {"主线热点", "强势热点"}:
+        return True
+    if hot_rank is not None and hot_rank <= 20:
+        return True
+    return bool(attention_rank is not None and attention_rank <= 20)
+
+
+def _board_rank_tuple(row):
+    hot_rank = _to_float(row.get("热点排名") or row.get("hot_rank"))
+    attention_rank = _to_float(row.get("关注排名") or row.get("attention_rank"))
+    hot_score = _to_float(row.get("热点分") or row.get("hot_score"))
+    attention_score = _to_float(row.get("关注度分") or row.get("attention_score"))
+    return (
+        hot_rank if hot_rank is not None else 999,
+        attention_rank if attention_rank is not None else 999,
+        -(hot_score or 0),
+        -(attention_score or 0),
+    )
+
+
+def _rank_score_by_rank(rank, max_score=10, floor=30):
+    rank = _to_float(rank)
+    if rank is None:
+        return 0
+    if rank <= 1:
+        return max_score
+    if rank >= floor:
+        return 0
+    return round(max_score * (floor - rank) / (floor - 1), 2)
+
+
+def _board_lookup(boards):
+    if boards is None or boards.empty:
+        return {}
+    lookup = {}
+    for row in boards.to_dict("records"):
+        name = _board_name(row)
+        if not name:
+            continue
+        if name not in lookup or _board_rank_tuple(row) < _board_rank_tuple(lookup[name]):
+            lookup[name] = row
+    return lookup
+
+
+def _score_board(board):
+    if board is None:
+        return {"score": 0.0, "reasons": [], "warnings": []}
+
+    score = 0.0
+    reasons = []
+    warnings = []
+    version = str(board.get("热点版本") or "")
+    shape = str(board.get("参与形态") or "")
+    advice = str(board.get("参与建议") or "")
+    risk = str(board.get("风险提示") or "")
+
+    if version in HOT_VERSION_SCORE:
+        score += HOT_VERSION_SCORE[version]
+        reasons.append(version)
+    score += _rank_score_by_rank(board.get("热点排名"), max_score=12, floor=35)
+    score += _rank_score_by_rank(board.get("关注排名"), max_score=10, floor=35)
+
+    if "主线延续" in shape:
+        score += 10
+        reasons.append("主线延续")
+    elif "加速高潮" in shape:
+        score -= 8
+        warnings.append("加速高潮")
+    elif "放量下跌" in shape:
+        score -= 12
+        warnings.append("放量下跌")
+
+    if "优先跟踪" in advice:
+        score += 10
+        reasons.append("报告建议优先跟踪")
+    if "等分歧" in advice or "二次确认" in advice:
+        score += 4
+        reasons.append("适合等分歧确认")
+    if "谨慎追高" in advice:
+        score -= 8
+        warnings.append("报告提示谨慎追高")
+    if "回避" in advice:
+        score -= 25
+        warnings.append("报告提示回避")
+
+    breadth_today = _to_float(board.get("上涨广度"))
+    breadth_5d = _to_float(board.get("5日广度"))
+    amount_ratio = _to_float(board.get("额比5日"))
+    top3_share = _to_float(board.get("前三成交占比"))
+    attention_delta = _to_float(board.get("关注较昨日"))
+    attention_delta_5d = _to_float(board.get("关注较5日"))
+
+    if breadth_today is not None:
+        if breadth_today >= 60:
+            score += 7
+            reasons.append("板块广度强")
+        elif breadth_today >= 40:
+            score += 4
+        elif breadth_today < 20:
+            score -= 7
+            warnings.append("板块广度弱")
+    if breadth_5d is not None and breadth_5d >= 50:
+        score += 4
+    if amount_ratio is not None:
+        if amount_ratio >= 1.5:
+            score += 7
+            reasons.append("资金放大")
+        elif amount_ratio >= 1.1:
+            score += 4
+        elif amount_ratio < 0.8:
+            score -= 4
+            warnings.append("资金不足")
+    if attention_delta is not None and attention_delta >= 15:
+        score += 5
+        reasons.append("关注度上升")
+    elif attention_delta is not None and attention_delta <= -15:
+        score -= 4
+    if attention_delta_5d is not None and attention_delta_5d >= 20:
+        score += 5
+    if top3_share is not None:
+        if top3_share >= 85:
+            score -= 8
+            warnings.append("前三成交过度集中")
+        elif top3_share >= 70:
+            score -= 4
+            warnings.append("成交集中")
+    if "成交过度集中" in risk:
+        score -= 4
+        warnings.append("成交过度集中")
+
+    return {"score": round(score, 2), "reasons": reasons, "warnings": warnings}
+
+
+def _leader_stability(leaders, board_name):
+    if leaders is None or leaders.empty or not board_name:
+        return {"leaders": [], "summary": "--"}
+    frame = leaders[leaders["板块名称"].astype(str) == str(board_name)].copy()
+    if frame.empty:
+        return {"leaders": [], "summary": "--"}
+    grouped = []
+    for code, group in frame.groupby("股票代码", sort=False):
+        code = _normalize_code(code)
+        if not code:
+            continue
+        group = group.sort_values("_review_date")
+        latest = group.iloc[-1].to_dict()
+        grouped.append(
+            {
+                "stock_code": code,
+                "stock_name": latest.get("股票名称") or code,
+                "appear_days": int(group["_review_date"].nunique()),
+                "latest_rank": _to_float(latest.get("板块内龙头排名")),
+                "latest_type": latest.get("龙头类型"),
+                "latest_change": latest.get("今日涨幅"),
+            }
+        )
+    grouped = sorted(
+        grouped,
+        key=lambda item: (
+            -item["appear_days"],
+            item["latest_rank"] if item["latest_rank"] is not None else 999,
+        ),
+    )
+    summary_bits = [
+        f"{item['stock_name']}({item['stock_code']}, {item['appear_days']}天)"
+        for item in grouped[:3]
+    ]
+    return {"leaders": grouped[:5], "summary": " / ".join(summary_bits) or "--"}
+
+
+def _top_leader_code_on_date(board_group, date_value):
+    if not date_value:
+        return None
+    rows = board_group[board_group["_review_date"].astype(str) == str(date_value)].copy()
+    if rows.empty:
+        return None
+    rows["_leader_rank_tmp"] = rows["板块内龙头排名"].apply(_to_float)
+    rows = rows.sort_values("_leader_rank_tmp", na_position="last")
+    return _normalize_code(rows.iloc[0].get("股票代码"))
+
+
+def _leader_transition_lookup(leaders):
+    if leaders is None or leaders.empty or "_review_date" not in leaders.columns:
+        return {}
+    frame = leaders.copy()
+    frame["股票代码"] = frame["股票代码"].apply(_normalize_code)
+    frame = frame[frame["股票代码"].notna()].copy()
+    if frame.empty:
+        return {}
+
+    lookup = {}
+    for board_name, board_group in frame.groupby("板块名称", sort=False):
+        board_name = str(board_name or "").strip()
+        if not board_name:
+            continue
+        board_group = board_group.copy()
+        board_group["_review_date_text"] = board_group["_review_date"].astype(str)
+        board_dates = sorted(date for date in board_group["_review_date_text"].dropna().unique() if date)
+        if not board_dates:
+            continue
+        latest_board_date = board_dates[-1]
+        previous_board_date = board_dates[-2] if len(board_dates) >= 2 else None
+        previous_top_code = _top_leader_code_on_date(board_group, previous_board_date)
+
+        for code, group in board_group.groupby("股票代码", sort=False):
+            code = _normalize_code(code)
+            if not code:
+                continue
+            group = group.sort_values("_review_date_text")
+            latest = group.iloc[-1].to_dict()
+            latest_date = str(latest.get("_review_date_text") or latest.get("_review_date") or "")
+            appeared_dates = sorted(date for date in group["_review_date_text"].dropna().unique() if date)
+            previous_rows = group[group["_review_date_text"] < latest_date]
+            previous = previous_rows.iloc[-1].to_dict() if not previous_rows.empty else {}
+            latest_rank = _to_float(latest.get("板块内龙头排名"))
+            previous_rank = _to_float(previous.get("板块内龙头排名"))
+            rank_change = None
+            if latest_rank is not None and previous_rank is not None:
+                rank_change = previous_rank - latest_rank
+            is_latest_report = latest_date == latest_board_date
+            is_new = is_latest_report and len(appeared_dates) == 1
+            is_top_switch = bool(
+                is_latest_report
+                and latest_rank == 1
+                and previous_top_code
+                and previous_top_code != code
+            )
+            lookup[(board_name, code)] = {
+                "board_name": board_name,
+                "stock_code": code,
+                "stock_name": latest.get("股票名称") or code,
+                "appear_days": int(len(appeared_dates)),
+                "latest_date": latest_date,
+                "first_date": appeared_dates[0] if appeared_dates else None,
+                "latest_rank": latest_rank,
+                "previous_rank": previous_rank,
+                "rank_change": rank_change,
+                "latest_type": latest.get("龙头类型"),
+                "previous_type": previous.get("龙头类型"),
+                "is_latest_report": is_latest_report,
+                "is_new": is_new,
+                "is_top_switch": is_top_switch,
+                "previous_top_code": previous_top_code,
+            }
+    return lookup
+
+
+def _board_trend_review(boards, leaders=None, total_days=0):
+    if boards is None or boards.empty:
+        return {}
+    total_days = int(total_days or boards["_review_date"].nunique() or 0)
+    review = {}
+    for name, group in boards.groupby("_board_name", sort=False):
+        name = str(name or "").strip()
+        if not name:
+            continue
+        group = group.sort_values("_review_date")
+        latest = group.iloc[-1].to_dict()
+        first = group.iloc[0].to_dict()
+        appear_days = int(group["_review_date"].nunique())
+        hot_ranks = [_to_float(value) for value in group.get("热点排名", pd.Series(dtype=object)).tolist()]
+        attention_ranks = [_to_float(value) for value in group.get("关注排名", pd.Series(dtype=object)).tolist()]
+        hot_ranks = [value for value in hot_ranks if value is not None]
+        attention_ranks = [value for value in attention_ranks if value is not None]
+        latest_hot_rank = _to_float(latest.get("热点排名"))
+        latest_attention_rank = _to_float(latest.get("关注排名"))
+        first_hot_rank = _to_float(first.get("热点排名"))
+        first_attention_rank = _to_float(first.get("关注排名"))
+        mainline_days = int(
+            group["热点版本"].astype(str).isin(["主线热点", "强势热点"]).sum()
+            if "热点版本" in group.columns
+            else 0
+        )
+        board_score = _score_board(latest)
+        stability_score = board_score["score"]
+        stability_score += min(24, appear_days * 7)
+        if total_days and appear_days >= min(3, total_days):
+            stability_score += 8
+        if mainline_days >= 2:
+            stability_score += 8
+        if latest_hot_rank is not None and latest_hot_rank <= 10:
+            stability_score += 10
+        elif latest_hot_rank is not None and latest_hot_rank <= 20:
+            stability_score += 5
+        if hot_ranks and sum(hot_ranks) / len(hot_ranks) <= 20:
+            stability_score += 8
+        if first_hot_rank is not None and latest_hot_rank is not None and latest_hot_rank < first_hot_rank:
+            stability_score += 6
+        if (
+            first_attention_rank is not None
+            and latest_attention_rank is not None
+            and latest_attention_rank < first_attention_rank
+        ):
+            stability_score += 5
+
+        warnings = list(board_score["warnings"])
+        latest_shape = str(latest.get("参与形态") or "")
+        latest_advice = str(latest.get("参与建议") or "")
+        if "放量下跌" in latest_shape or "回避" in latest_advice:
+            stability_score -= 18
+            warnings.append("昨日分歧/回避")
+        elif "加速高潮" in latest_shape or "谨慎追高" in latest_advice:
+            stability_score -= 8
+            warnings.append("昨日高潮/不宜追")
+
+        if "昨日分歧/回避" in warnings:
+            conclusion = "分歧回避"
+        elif "昨日高潮/不宜追" in warnings:
+            conclusion = "过热不追"
+        elif stability_score >= 72 and appear_days >= 2:
+            conclusion = "持续稳定关注"
+        elif stability_score >= 58:
+            conclusion = "可跟踪但等确认"
+        else:
+            conclusion = "弱观察"
+
+        leader_info = _leader_stability(leaders, name)
+        review[name] = {
+            "board_name": name,
+            "score": round(stability_score, 2),
+            "conclusion": conclusion,
+            "appear_days": appear_days,
+            "total_days": total_days,
+            "mainline_days": mainline_days,
+            "latest_hot_rank": latest_hot_rank,
+            "latest_attention_rank": latest_attention_rank,
+            "avg_hot_rank": round(sum(hot_ranks) / len(hot_ranks), 2) if hot_ranks else None,
+            "avg_attention_rank": round(sum(attention_ranks) / len(attention_ranks), 2) if attention_ranks else None,
+            "latest_version": latest.get("热点版本"),
+            "latest_shape": latest.get("参与形态"),
+            "latest_advice": latest.get("参与建议"),
+            "reasons": list(dict.fromkeys(board_score["reasons"])),
+            "warnings": list(dict.fromkeys(warnings)),
+            "leader_summary": leader_info["summary"],
+            "leaders": leader_info["leaders"],
+        }
+    return review
+
+
+def _top_board_reviews(board_review, limit=8):
+    values = list((board_review or {}).values())
+    values = sorted(
+        values,
+        key=lambda item: (
+            -(item.get("score") or 0),
+            item.get("latest_hot_rank") or 999,
+            -(item.get("appear_days") or 0),
+        ),
+    )
+    return values[: int(limit or 8)]
+
+
+def _focus_board_names(boards, board_limit=25):
+    if boards is None or boards.empty:
+        return []
+    frame = boards.copy()
+    frame["_board_name"] = frame.apply(_board_name, axis=1)
+    frame = frame[frame["_board_name"].astype(bool)].copy()
+    frame = frame[frame.apply(_is_focus_board, axis=1)].copy()
+    if frame.empty:
+        return []
+    frame["_sort_hot_rank"] = frame.apply(lambda row: _board_rank_tuple(row)[0], axis=1)
+    frame["_sort_attention_rank"] = frame.apply(lambda row: _board_rank_tuple(row)[1], axis=1)
+    frame["_board_score"] = frame.apply(lambda row: _score_board(row)["score"], axis=1)
+    frame = frame.sort_values(["_board_score", "_sort_hot_rank", "_sort_attention_rank"], ascending=[False, True, True])
+    return frame.head(int(board_limit or 25))["_board_name"].tolist()
+
+
+def _load_industry_leader_candidates(leaders, boards=None, board_limit=25, leaders_per_board=3):
+    if leaders is None or leaders.empty:
+        return pd.DataFrame()
+    frame = leaders.copy()
+    frame["股票代码"] = frame["股票代码"].apply(_normalize_code)
+    frame = frame[frame["股票代码"].notna()].copy()
+    frame["_hot_rank"] = frame["热点排名"].apply(_to_float) if "热点排名" in frame.columns else math.inf
+    frame["_leader_rank"] = frame["板块内龙头排名"].apply(_to_float) if "板块内龙头排名" in frame.columns else 999
+    focus_boards = _focus_board_names(boards, board_limit=board_limit)
+    if focus_boards:
+        frame = frame[frame["板块名称"].isin(focus_boards)].copy()
+    else:
+        frame = frame[frame.apply(_is_focus_board, axis=1)].copy()
+    frame = frame.sort_values(["_hot_rank", "板块名称", "_leader_rank"]).groupby("板块名称", sort=False).head(
+        int(leaders_per_board)
+    )
+    return frame
+
+
+def _fetch_sina_quotes(stock_codes, timeout=8, chunk_size=80):
+    symbols = []
+    symbol_to_code = {}
+    for code in stock_codes:
+        symbol = _realtime_symbol(code)
+        if not symbol:
+            continue
+        symbols.append(symbol)
+        symbol_to_code[symbol] = code
+
+    quotes = {}
+    for start in range(0, len(symbols), chunk_size):
+        chunk = symbols[start : start + chunk_size]
+        url = SINA_REALTIME_URL.format(symbols=",".join(chunk))
+        try:
+            response = requests.get(url, headers=SINA_HEADERS, timeout=timeout)
+            response.raise_for_status()
+            response.encoding = "gb18030"
+        except Exception:
+            continue
+        for matched in re.finditer(r'var hq_str_([^=]+)="(.*?)";', response.text or ""):
+            symbol, raw = matched.group(1), matched.group(2)
+            code = symbol_to_code.get(symbol)
+            quote = _parse_sina_quote(symbol, raw)
+            if code and quote:
+                quotes[code] = quote
+    return quotes
+
+
+def _parse_sina_quote(symbol, raw):
+    fields = str(raw or "").split(",")
+    if len(fields) < 32:
+        return None
+    current = _to_float(fields[3])
+    prev_close = _to_float(fields[2])
+    open_price = _to_float(fields[1])
+    high = _to_float(fields[4])
+    low = _to_float(fields[5])
+    amount = _to_float(fields[9])
+    volume = _to_float(fields[8])
+    if current is None or current <= 0:
+        return None
+    return {
+        "symbol": symbol,
+        "name": fields[0].strip(),
+        "open": _round(open_price, 2),
+        "prev_close": _round(prev_close, 2),
+        "current": _round(current, 2),
+        "high": _round(high, 2),
+        "low": _round(low, 2),
+        "bid": _round(fields[6], 2),
+        "ask": _round(fields[7], 2),
+        "volume_hands": _round((volume or 0) / 100.0, 2),
+        "amount": _round(amount, 2),
+        "change_pct": _round((current / prev_close - 1) * 100 if prev_close else None, 2),
+        "open_gap_pct": _round((open_price / prev_close - 1) * 100 if prev_close else None, 2),
+        "current_from_open_pct": _round((current / open_price - 1) * 100 if open_price else None, 2),
+        "low_from_prev_pct": _round((low / prev_close - 1) * 100 if prev_close else None, 2),
+        "high_from_prev_pct": _round((high / prev_close - 1) * 100 if prev_close else None, 2),
+        "quote_datetime": f"{fields[30].strip()} {fields[31].strip()}".strip(),
+    }
+
+
+def _fetch_market_summary():
+    symbols = "s_sh000001,s_sz399001,s_sz399006"
+    url = SINA_REALTIME_URL.format(symbols=symbols)
+    try:
+        response = requests.get(url, headers=SINA_HEADERS, timeout=6)
+        response.raise_for_status()
+        response.encoding = "gb18030"
+    except Exception:
+        return []
+    indices = []
+    for matched in re.finditer(r'var hq_str_([^=]+)="(.*?)";', response.text or ""):
+        fields = matched.group(2).split(",")
+        if len(fields) >= 4:
+            indices.append(
+                {
+                    "name": fields[0].strip(),
+                    "current": _round(fields[1], 2),
+                    "change": _round(fields[2], 2),
+                    "change_pct": _round(fields[3], 2),
+                }
+            )
+    return indices
+
+
+def _add_candidate(candidates, code, name=None):
+    code = _normalize_code(code)
+    if not code:
+        return None
+    item = candidates.setdefault(
+        code,
+        {
+            "stock_code": code,
+            "stock_name": name or code,
+            "sources": [],
+            "strategy": None,
+            "strategies": [],
+            "industry_leaders": [],
+        },
+    )
+    if name and (not item.get("stock_name") or item.get("stock_name") == code):
+        item["stock_name"] = name
+    return item
+
+
+def _merge_candidates(strategy_frame, leader_frame):
+    candidates = {}
+    if strategy_frame is not None and not strategy_frame.empty:
+        for row in strategy_frame.to_dict("records"):
+            item = _add_candidate(candidates, row.get("stock_code"), row.get("stock_name"))
+            if not item:
+                continue
+            item["strategies"].append(row)
+            if item.get("strategy") is None:
+                item["strategy"] = row
+            item["sources"].append("策略落盘")
+
+    if leader_frame is not None and not leader_frame.empty:
+        for row in leader_frame.to_dict("records"):
+            item = _add_candidate(candidates, row.get("股票代码"), row.get("股票名称"))
+            if not item:
+                continue
+            item["industry_leaders"].append(row)
+            item["sources"].append("行业龙头")
+    return list(candidates.values())
+
+
+def _amount_ratio(quote, strategy, leader, board=None):
+    amount = _to_float((quote or {}).get("amount"))
+    base = _to_float((strategy or {}).get("amount_avg_5d"))
+    if base is None and leader:
+        amount_yi = _to_float(leader.get("今日成交额_亿"))
+        ratio = _to_float(leader.get("成交额较5日均额倍数"))
+        if amount_yi is not None and ratio:
+            base = amount_yi * 100000000 / ratio
+    if base is None and board:
+        amount_yi = _to_float(board.get("成交额亿"))
+        ratio = _to_float(board.get("额比5日"))
+        if amount_yi is not None and ratio:
+            base = amount_yi * 100000000 / ratio
+    if amount is None or not base:
+        return None
+    return round(amount / base, 2)
+
+
+def _best_leader(industry_leaders):
+    if not industry_leaders:
+        return None
+    return sorted(
+        industry_leaders,
+        key=lambda row: (
+            _to_float(row.get("热点排名")) if _to_float(row.get("热点排名")) is not None else 999,
+            _to_float(row.get("板块内龙头排名")) if _to_float(row.get("板块内龙头排名")) is not None else 999,
+        ),
+    )[0]
+
+
+def _board_from_candidate(strategy, leader, board_lookup):
+    board_lookup = board_lookup or {}
+    if leader:
+        name = str(leader.get("板块名称") or "").strip()
+        if name in board_lookup:
+            return board_lookup[name]
+    for name in str((strategy or {}).get("industry") or "").split(","):
+        name = name.strip()
+        if name in board_lookup:
+            return board_lookup[name]
+    return None
+
+
+def _board_review_from_candidate(strategy, leader, board_review):
+    board_review = board_review or {}
+    if leader:
+        name = str(leader.get("板块名称") or "").strip()
+        if name in board_review:
+            return board_review[name]
+    for name in str((strategy or {}).get("industry") or "").split(","):
+        name = name.strip()
+        if name in board_review:
+            return board_review[name]
+    return None
+
+
+def _leader_transition_from_candidate(leader, leader_transition_lookup):
+    if not leader:
+        return None
+    board_name = str(leader.get("板块名称") or "").strip()
+    stock_code = _normalize_code(leader.get("股票代码"))
+    if not board_name or not stock_code:
+        return None
+    return (leader_transition_lookup or {}).get((board_name, stock_code))
+
+
+def _leader_rank_text(transition):
+    if not transition:
+        return "--"
+    latest_rank = _to_float(transition.get("latest_rank"))
+    previous_rank = _to_float(transition.get("previous_rank"))
+    if latest_rank is None:
+        return "--"
+    latest_text = f"第{int(latest_rank)}"
+    if previous_rank is None:
+        return f"新进{latest_text}"
+    previous_text = f"第{int(previous_rank)}"
+    if latest_rank < previous_rank:
+        return f"{previous_text}->{latest_text}"
+    if latest_rank > previous_rank:
+        return f"{previous_text}->{latest_text}回落"
+    return f"{latest_text}延续"
+
+
+def _score_leader_transition(transition, board_review_item):
+    if not transition:
+        return {
+            "score": 0.0,
+            "label": "--",
+            "advice": "--",
+            "rank_text": "--",
+            "reasons": [],
+            "warnings": [],
+        }
+
+    board_conclusion = str((board_review_item or {}).get("conclusion") or "")
+    latest_rank = _to_float(transition.get("latest_rank"))
+    rank_change = _to_float(transition.get("rank_change"))
+    appear_days = int(transition.get("appear_days") or 0)
+    is_new = bool(transition.get("is_new"))
+    is_top_switch = bool(transition.get("is_top_switch"))
+    score = 0.0
+    reasons = []
+    warnings = []
+
+    if is_new and board_conclusion == "过热不追":
+        label = "新晋但过热"
+        score -= 4
+        warnings.append("新晋龙头但板块过热")
+        advice = "只看分歧承接，不追加速"
+    elif is_new and board_conclusion == "分歧回避":
+        label = "新晋但分歧"
+        score -= 8
+        warnings.append("新晋龙头但板块分歧")
+        advice = "先回避，等板块风险释放"
+    elif is_new and latest_rank == 1:
+        label = "新晋主攻龙头"
+        score += 16
+        reasons.append("新晋板块第一龙头")
+        advice = "重点看开盘承接和换手后的二次确认"
+    elif is_new:
+        label = "新晋龙头"
+        score += 10
+        reasons.append("最近新进板块龙头")
+        advice = "可关注，但必须跟随板块强度确认"
+    elif is_top_switch:
+        label = "新龙替旧龙"
+        score += 12
+        reasons.append("板块第一龙头发生切换")
+        advice = "重点看能否带动板块扩散"
+    elif rank_change is not None and rank_change > 0:
+        label = "龙头排名上升"
+        score += 8
+        reasons.append("龙头排名上升")
+        advice = "看排名上升后能否放量延续"
+    elif appear_days >= 2:
+        label = "老龙延续"
+        score += 5
+        reasons.append(f"龙头连续出现{appear_days}天")
+        advice = "按趋势延续处理，弱转强才加分"
+    else:
+        label = "普通龙头"
+        advice = "按普通板块龙头观察"
+
+    if latest_rank is not None and latest_rank <= 1 and board_conclusion not in {"过热不追", "分歧回避"}:
+        score += 3
+    if board_conclusion == "持续稳定关注" and label in {"新晋主攻龙头", "新晋龙头", "新龙替旧龙"}:
+        score += 5
+        reasons.append("新龙匹配稳定主线")
+    if board_conclusion == "过热不追" and label not in {"新晋但过热"}:
+        warnings.append("板块过热，龙头信号降级")
+    if board_conclusion == "分歧回避" and label not in {"新晋但分歧"}:
+        warnings.append("板块分歧，龙头信号降级")
+
+    return {
+        "score": round(score, 2),
+        "label": label,
+        "advice": advice,
+        "rank_text": _leader_rank_text(transition),
+        "reasons": reasons,
+        "warnings": warnings,
+    }
+
+
+def _score_strategy_context(strategy, strategies):
+    if not strategy:
+        return 0.0, [], []
+    age = _to_float(strategy.get("strategy_age_trade_days"))
+    repeat_count = len(strategies or [])
+    score = 0.0
+    reasons = []
+    warnings = []
+
+    if age is None:
+        score += 12
+        reasons.append("近20日策略信号")
+    elif age <= 1:
+        score += 28
+        reasons.append("近1日策略信号")
+    elif age <= 4:
+        score += 22
+        reasons.append(f"近{int(age) + 1}日策略信号")
+    elif age <= 9:
+        score += 16
+        reasons.append(f"近{int(age) + 1}日策略信号")
+    else:
+        score += 10
+        reasons.append("较早策略信号")
+
+    strategy_type = str(strategy.get("strategy_type") or "")
+    if "adaptive" in strategy_type:
+        score += 6
+        reasons.append("自适应策略")
+    elif "long_runway" in strategy_type:
+        score += 3
+        reasons.append("长跑跟踪")
+
+    if repeat_count >= 2:
+        score += min(8, 3 + repeat_count)
+        reasons.append(f"近20日多次出现{repeat_count}次")
+    if age is not None and age >= 10:
+        warnings.append("策略信号偏旧")
+    return score, reasons, warnings
+
+
+def _safe_price_text(label, value):
+    value = _round(value, 2)
+    return f"{label}{value}" if value is not None else None
+
+
+def _build_trade_texts(state, level, strategy, quote):
+    current = _to_float((quote or {}).get("current"))
+    prev_close = _to_float((quote or {}).get("prev_close"))
+    open_price = _to_float((quote or {}).get("open"))
+    day_high = _to_float((quote or {}).get("high"))
+    day_low = _to_float((quote or {}).get("low"))
+    ref_low = _to_float((strategy or {}).get("ref_low"))
+    stop_price = _to_float((strategy or {}).get("stop_price"))
+
+    supports = [
+        _safe_price_text("防守", stop_price),
+        _safe_price_text("昨收", prev_close),
+        _safe_price_text("开盘", open_price),
+    ]
+    supports = [item for item in supports if item]
+    support_text = " / ".join(supports[:2]) or "--"
+    high_text = _safe_price_text("日高", day_high) or "--"
+    weak_lines = [
+        _safe_price_text("防守", stop_price),
+        _safe_price_text("昨低", ref_low),
+        _safe_price_text("日低", day_low),
+    ]
+    weak_text = " / ".join([item for item in weak_lines if item][:2]) or "--"
+
+    if state == "跌破防守":
+        return "无", f"不能快速收回{support_text}就不看", f"已跌破{weak_text}，先降风险"
+    if state == "触板回落":
+        return "等承接", f"不追；等重新站回{high_text}，或回踩不破{support_text}后再看", f"跌回{weak_text}或反抽不过{high_text}"
+    if level in {"核心盯盘", "重点关注"}:
+        if current is not None and day_high is not None and current >= day_high * 0.985:
+            trigger = f"不追现价；等回踩不破{support_text}后再突破{high_text}"
+        else:
+            trigger = f"站稳{support_text}，并放量重新上攻{high_text}"
+        invalid = f"跌回{weak_text}或冲高回落不收回昨收"
+        return "等确认", trigger, invalid
+    if level == "二级观察":
+        return "观察", f"先收回{support_text}，再看二次放量", f"跌破{weak_text}或午后仍弱于昨收"
+    return "放弃", f"除非快速收回{support_text}", f"跌破{weak_text}继续回避"
+
+
+def _limit_up_pct(stock_code, stock_name=None):
+    code = _normalize_code(stock_code)
+    name = str(stock_name or "")
+    if "ST" in name.upper():
+        return 5.0
+    if code and code.startswith(("300", "301", "688", "689")):
+        return 20.0
+    if code and code.startswith(("920", "8", "4")):
+        return 30.0
+    return 10.0
+
+
+def _score_candidate(candidate, quote, board_lookup=None, board_review=None, leader_transition_lookup=None):
+    strategy = candidate.get("strategy") or {}
+    strategies = candidate.get("strategies") or []
+    leader = _best_leader(candidate.get("industry_leaders") or [])
+    board = _board_from_candidate(strategy, leader, board_lookup)
+    board_review_item = _board_review_from_candidate(strategy, leader, board_review)
+    leader_transition = _leader_transition_from_candidate(leader, leader_transition_lookup)
+    leader_transition_score = _score_leader_transition(leader_transition, board_review_item)
+    board_score = _score_board(board)
+    score = 0.0
+    reasons = []
+    warnings = []
+
+    if strategy:
+        strategy_score, strategy_reasons, strategy_warnings = _score_strategy_context(strategy, strategies)
+        score += strategy_score
+        reasons.extend(strategy_reasons)
+        warnings.extend(strategy_warnings)
+
+    if board:
+        score += board_score["score"] * 0.45
+        reasons.extend(board_score["reasons"])
+        warnings.extend(board_score["warnings"])
+
+    if board_review_item:
+        conclusion = str(board_review_item.get("conclusion") or "")
+        appear_days = board_review_item.get("appear_days") or 0
+        total_days = board_review_item.get("total_days") or 0
+        score += (board_review_item.get("score") or 0) * 0.3
+        reasons.append(f"板块近几日{appear_days}/{total_days}日上榜")
+        if conclusion == "持续稳定关注":
+            score += 8
+            reasons.append("板块持续稳定关注")
+        elif conclusion == "可跟踪但等确认":
+            score += 3
+            reasons.append("板块可跟踪")
+        elif conclusion == "过热不追":
+            score -= 10
+            warnings.append("板块过热不追")
+        elif conclusion == "分歧回避":
+            score -= 18
+            warnings.append("板块昨日分歧回避")
+        elif conclusion == "弱观察":
+            score -= 5
+            warnings.append("板块延续性一般")
+        warnings.extend(board_review_item.get("warnings") or [])
+
+    if leader:
+        score += leader_transition_score["score"]
+        reasons.extend(leader_transition_score["reasons"])
+        warnings.extend(leader_transition_score["warnings"])
+        score += 10
+        reasons.append(f"{leader.get('板块名称') or '--'}龙头")
+        leader_type = str(leader.get("龙头类型") or "")
+        for key, value in LEADER_TYPE_SCORE.items():
+            if key in leader_type:
+                score += value
+                break
+        score += _rank_score_by_rank(leader.get("热点排名"), max_score=9, floor=30)
+        score += _rank_score_by_rank(leader.get("关注排名"), max_score=7, floor=30)
+        risk = str(leader.get("风险提示") or "")
+        if "成交过度集中" in risk:
+            score -= 3
+            warnings.append("成交过度集中")
+
+    if not quote:
+        level = "二级观察" if score >= 55 else "暂不关注"
+        intention, trigger, invalid = _build_trade_texts("无实时行情", level, strategy, quote)
+        return {
+            "score": round(score, 2),
+            "level": level,
+            "state": "无实时行情",
+            "action": "无法盘中确认，先不升级关注",
+            "intention": intention,
+            "trigger": trigger,
+            "invalid": invalid,
+            "reasons": reasons,
+            "warnings": warnings,
+            "key_levels": _key_levels(strategy),
+            "amount_ratio": None,
+            "board_score": board_score["score"],
+            "board_review_score": (board_review_item or {}).get("score"),
+            "board_conclusion": (board_review_item or {}).get("conclusion"),
+            "board_leader_summary": (board_review_item or {}).get("leader_summary"),
+            "leader_transition_label": leader_transition_score["label"],
+            "leader_transition_advice": leader_transition_score["advice"],
+            "leader_rank_text": leader_transition_score["rank_text"],
+            "leader_appear_days": (leader_transition or {}).get("appear_days"),
+        }
+
+    current = _to_float(quote.get("current"))
+    prev_close = _to_float(quote.get("prev_close"))
+    open_price = _to_float(quote.get("open"))
+    high = _to_float(quote.get("high"))
+    low = _to_float(quote.get("low"))
+    change_pct = _to_float(quote.get("change_pct"))
+    high_from_prev_pct = _to_float(quote.get("high_from_prev_pct"))
+    day_position = None
+    if current is not None and high is not None and low is not None and high > low:
+        day_position = (current - low) / (high - low) * 100
+
+    ref_high = _to_float(strategy.get("ref_high"))
+    ref_low = _to_float(strategy.get("ref_low"))
+    stop_price = _to_float(strategy.get("stop_price"))
+    amount_ratio = _amount_ratio(quote, strategy, leader, board=board)
+
+    if change_pct is not None:
+        if change_pct >= 5:
+            score += 24
+            reasons.append("盘中强攻")
+        elif change_pct >= 3:
+            score += 18
+            reasons.append("盘中走强")
+        elif change_pct >= 1:
+            score += 10
+            reasons.append("盘中红盘修复")
+        elif change_pct >= 0:
+            score += 5
+            reasons.append("站在红盘")
+        elif change_pct <= -3:
+            score -= 16
+            warnings.append("盘中明显走弱")
+        elif change_pct <= -1:
+            score -= 8
+            warnings.append("盘中偏弱")
+
+    if current is not None and prev_close is not None and current >= prev_close:
+        score += 6
+        reasons.append("站回昨收")
+    if current is not None and open_price is not None and current >= open_price:
+        score += 5
+        reasons.append("站回开盘")
+    if day_position is not None:
+        if day_position >= 75:
+            score += 8
+            reasons.append("日内位置偏强")
+        elif day_position <= 35:
+            score -= 6
+            warnings.append("日内位置偏低")
+    if ref_high is not None and current is not None and current >= ref_high:
+        score += 10
+        reasons.append("突破昨日高点")
+    if ref_low is not None and low is not None and low < ref_low:
+        score -= 8
+        warnings.append("盘中跌破昨日低点")
+    if amount_ratio is not None:
+        if amount_ratio >= 1.0:
+            score += 8
+            reasons.append("盘中成交已超5日均额")
+        elif amount_ratio >= 0.55:
+            score += 4
+            reasons.append("盘中成交放大")
+    limit_up_pct = _limit_up_pct(candidate.get("stock_code"), (quote or {}).get("name") or candidate.get("stock_name"))
+    touched_limit_up = bool(
+        high_from_prev_pct is not None
+        and high_from_prev_pct >= limit_up_pct - 0.35
+    )
+    limit_fade = bool(
+        touched_limit_up
+        and current is not None
+        and high is not None
+        and current < high * 0.97
+    )
+    if touched_limit_up:
+        reasons.append("盘中触及涨停")
+    if limit_fade:
+        score -= 10
+        warnings.append("触板回落")
+    stop_broken = bool(stop_price is not None and current is not None and current < stop_price)
+    if stop_broken:
+        score -= 35
+        warnings.append("跌破策略防守")
+
+    if stop_broken:
+        state = "跌破防守"
+    elif limit_fade:
+        state = "触板回落"
+    elif change_pct is not None and change_pct >= 3 and day_position and day_position >= 65:
+        state = "盘中强势"
+    elif current is not None and prev_close is not None and current >= prev_close:
+        state = "修复走强"
+    elif day_position is not None and day_position >= 55:
+        state = "弱修复"
+    else:
+        state = "承接偏弱"
+
+    if stop_broken:
+        level = "回避"
+        action = "回避新买点；持仓按策略先降风险"
+    elif score >= 92:
+        level = "核心盯盘"
+        action = "只等分歧承接或二次确认，不追高一笔打满"
+    elif score >= 72:
+        level = "重点关注"
+        action = "等回踩承接或重新突破日高后再考虑"
+    elif score >= 55:
+        level = "二级观察"
+        action = "观察，不满足触发条件不动手"
+    else:
+        level = "暂不关注"
+        action = "暂不关注，除非快速收回关键位"
+    intention, trigger, invalid = _build_trade_texts(state, level, strategy, quote)
+
+    return {
+        "score": round(score, 2),
+        "level": level,
+        "state": state,
+        "action": action,
+        "intention": intention,
+        "trigger": trigger,
+        "invalid": invalid,
+        "reasons": reasons,
+        "warnings": warnings,
+        "key_levels": _key_levels(strategy, quote),
+        "amount_ratio": amount_ratio,
+        "day_position": _round(day_position, 2),
+        "board_score": board_score["score"],
+        "board_review_score": (board_review_item or {}).get("score"),
+        "board_conclusion": (board_review_item or {}).get("conclusion"),
+        "board_leader_summary": (board_review_item or {}).get("leader_summary"),
+        "leader_transition_label": leader_transition_score["label"],
+        "leader_transition_advice": leader_transition_score["advice"],
+        "leader_rank_text": leader_transition_score["rank_text"],
+        "leader_appear_days": (leader_transition or {}).get("appear_days"),
+    }
+
+
+def _key_levels(strategy, quote=None):
+    levels = []
+    stop_price = _round((strategy or {}).get("stop_price"), 2)
+    if stop_price is not None:
+        levels.append(f"防守{stop_price}")
+    for label, key in [("昨低", "ref_low"), ("昨收", "ref_close"), ("昨高", "ref_high"), ("MA5", "ma5")]:
+        value = _round((strategy or {}).get(key), 2)
+        if value is not None:
+            levels.append(f"{label}{value}")
+    if quote:
+        prev_close = _round(quote.get("prev_close"), 2)
+        high = _round(quote.get("high"), 2)
+        if prev_close is not None and not any(f"昨收{prev_close}" == item for item in levels):
+            levels.append(f"昨收{prev_close}")
+        if high is not None:
+            levels.append(f"日高{high}")
+    return " / ".join(levels[:5]) or "--"
+
+
+def _format_money_yi(value):
+    value = _to_float(value)
+    if value is None:
+        return "--"
+    return f"{round(value / 100000000, 2)}亿"
+
+
+def _industry_label(leader, board=None):
+    if not leader and not board:
+        return "--"
+    if not leader:
+        return (
+            f"{_board_name(board) or '--'}"
+            f"/{board.get('热点版本') or '--'}"
+            f"/热{board.get('热点排名') or '--'}"
+            f"/关{board.get('关注排名') or '--'}"
+        )
+    return (
+        f"{leader.get('板块名称') or '--'}"
+        f"/{(board or leader).get('热点版本') or '--'}"
+        f"/热{(board or leader).get('热点排名') or '--'}"
+        f"/关{(board or leader).get('关注排名') or '--'}"
+    )
+
+
+def build_intraday_focus(
+    trade_date=None,
+    strategy_date=None,
+    industry_date=None,
+    use_latest_history=False,
+    use_latest_strategy=False,
+    top=20,
+    board_limit=25,
+    leaders_per_board=3,
+    strategy_lookback_trade_days=DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS,
+    industry_review_days=DEFAULT_INDUSTRY_REVIEW_DAYS,
+):
+    warnings = []
+    target_trade_date = _date_text(trade_date) or _latest_history_date(before_today=not use_latest_history)
+    if not target_trade_date:
+        raise RuntimeError("无法确定上一完整交易日")
+
+    requested_strategy_date = _date_text(strategy_date)
+    strategy_frame = _load_strategy_candidates(
+        strategy_date=requested_strategy_date,
+        target_trade_date=target_trade_date,
+        lookback_trade_days=strategy_lookback_trade_days,
+    )
+    strategy_dates = sorted(set(strategy_frame["strategy_date_text"].dropna().tolist())) if not strategy_frame.empty else []
+    resolved_strategy_date = requested_strategy_date or (
+        f"{strategy_dates[0]}~{strategy_dates[-1]}" if strategy_dates else f"近{strategy_lookback_trade_days}个交易日"
+    )
+    if strategy_frame.empty and requested_strategy_date and use_latest_strategy:
+        fallback_date = _latest_strategy_date(target_trade_date)
+        if fallback_date and fallback_date != requested_strategy_date:
+            strategy_frame = _load_strategy_candidates(strategy_date=fallback_date)
+            resolved_strategy_date = fallback_date
+            warnings.append(f"交易日 {requested_strategy_date} 无策略落盘，已回退到最近策略日 {fallback_date}")
+    elif strategy_frame.empty:
+        warnings.append(f"{resolved_strategy_date} 无策略落盘，本次只用行业热点龙头观察")
+
+    resolved_industry_date = _date_text(industry_date) or _default_industry_date()
+    industry_dir, boards, leaders = _load_industry_reports(resolved_industry_date)
+    if industry_dir:
+        resolved_industry_date = industry_dir.name
+    else:
+        warnings.append(f"未找到 {resolved_industry_date} 及以前的行业热点报告")
+
+    review_dirs, review_boards, review_leaders = _load_industry_review(
+        resolved_industry_date,
+        review_days=industry_review_days,
+    )
+    board_review = _board_trend_review(
+        review_boards,
+        leaders=review_leaders,
+        total_days=len(review_dirs),
+    )
+    leader_transition_lookup = _leader_transition_lookup(review_leaders)
+    top_board_reviews = _top_board_reviews(board_review, limit=10)
+    if not review_dirs:
+        warnings.append("未找到可用于近几日比较的行业热点报告")
+
+    board_lookup = _board_lookup(boards)
+    leader_frame = _load_industry_leader_candidates(
+        leaders,
+        boards=boards,
+        board_limit=board_limit,
+        leaders_per_board=leaders_per_board,
+    )
+    candidates = _merge_candidates(strategy_frame, leader_frame)
+    stock_codes = [item["stock_code"] for item in candidates]
+    quotes = _fetch_sina_quotes(stock_codes)
+    market = _fetch_market_summary()
+
+    rows = []
+    for candidate in candidates:
+        code = candidate["stock_code"]
+        quote = quotes.get(code)
+        leader = _best_leader(candidate.get("industry_leaders") or [])
+        strategy = candidate.get("strategy") or {}
+        board = _board_from_candidate(strategy, leader, board_lookup)
+        scored = _score_candidate(
+            candidate,
+            quote,
+            board_lookup=board_lookup,
+            board_review=board_review,
+            leader_transition_lookup=leader_transition_lookup,
+        )
+        rows.append(
+            {
+                "stock_code": code,
+                "stock_name": (quote or {}).get("name") or candidate.get("stock_name"),
+                "sources": "、".join(dict.fromkeys(candidate.get("sources") or [])),
+                "score": scored["score"],
+                "level": scored.get("level"),
+                "state": scored["state"],
+                "action": scored["action"],
+                "intention": scored.get("intention"),
+                "trigger": scored.get("trigger"),
+                "invalid": scored.get("invalid"),
+                "current": (quote or {}).get("current"),
+                "change_pct": (quote or {}).get("change_pct"),
+                "open_gap_pct": (quote or {}).get("open_gap_pct"),
+                "day_position": scored.get("day_position"),
+                "amount": (quote or {}).get("amount"),
+                "amount_ratio": scored.get("amount_ratio"),
+                "board_score": scored.get("board_score"),
+                "board_review_score": scored.get("board_review_score"),
+                "board_conclusion": scored.get("board_conclusion"),
+                "board_leader_summary": scored.get("board_leader_summary"),
+                "leader_transition_label": scored.get("leader_transition_label"),
+                "leader_transition_advice": scored.get("leader_transition_advice"),
+                "leader_rank_text": scored.get("leader_rank_text"),
+                "leader_appear_days": scored.get("leader_appear_days"),
+                "board_name": (leader or {}).get("板块名称") or _board_name(board),
+                "industry_focus": _industry_label(leader, board=board),
+                "leader_type": (leader or {}).get("龙头类型"),
+                "key_levels": scored["key_levels"],
+                "reasons": "；".join(dict.fromkeys(scored["reasons"])) or "--",
+                "warnings": "；".join(dict.fromkeys(scored["warnings"])) or "--",
+                "quote_datetime": (quote or {}).get("quote_datetime"),
+                "strategy_date": _date_text(strategy.get("trade_date")) if strategy else None,
+                "strategy_type": strategy.get("strategy_type"),
+                "strategy_age_trade_days": strategy.get("strategy_age_trade_days"),
+                "strategy_hits": len(candidate.get("strategies") or []),
+                "industry_date": resolved_industry_date if leader else None,
+            }
+        )
+
+    result_frame = pd.DataFrame(rows)
+    leader_focus_rows = []
+    if not result_frame.empty:
+        focus_labels = {"新晋主攻龙头", "新晋龙头", "新龙替旧龙", "龙头排名上升", "新晋但过热", "新晋但分歧"}
+        leader_focus_frame = result_frame[result_frame["leader_transition_label"].isin(focus_labels)].copy()
+        if not leader_focus_frame.empty:
+            leader_focus_frame = leader_focus_frame.sort_values(["score", "change_pct"], ascending=[False, False]).head(10)
+            leader_focus_rows = leader_focus_frame.to_dict("records")
+        result_frame = result_frame.sort_values(["score", "change_pct"], ascending=[False, False]).head(int(top))
+
+    return {
+        "success": True,
+        "run_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "target_trade_date": target_trade_date,
+        "strategy_date": resolved_strategy_date,
+        "strategy_count": int(len(strategy_frame)),
+        "strategy_lookback_trade_days": int(strategy_lookback_trade_days or DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS),
+        "strategy_date_count": int(len(strategy_dates)),
+        "industry_date": resolved_industry_date,
+        "industry_dir": str(industry_dir) if industry_dir else None,
+        "industry_review_days": int(industry_review_days or DEFAULT_INDUSTRY_REVIEW_DAYS),
+        "industry_review_dates": [daily_dir.name for daily_dir in review_dirs],
+        "board_review_count": int(len(board_review)),
+        "top_board_reviews": top_board_reviews,
+        "leader_transition_count": int(len(leader_transition_lookup)),
+        "leader_focus_rows": leader_focus_rows,
+        "board_count": int(len(board_lookup)),
+        "leader_candidate_count": int(len(leader_frame)),
+        "candidate_count": int(len(candidates)),
+        "quote_count": int(len(quotes)),
+        "market": market,
+        "warnings": warnings,
+        "rows": result_frame.to_dict("records") if not result_frame.empty else [],
+    }
+
+
+def _market_text(market):
+    if not market:
+        return "--"
+    return "；".join(
+        f"{item.get('name')} {item.get('current')}({item.get('change_pct')}%)"
+        for item in market
+    )
+
+
+def _md_cell(value):
+    text = str(value if value is not None else "--").strip() or "--"
+    return text.replace("|", "/").replace("\n", " ")
+
+
+def _board_review_advice(item):
+    conclusion = str((item or {}).get("conclusion") or "")
+    latest_advice = str((item or {}).get("latest_advice") or "")
+    if conclusion == "持续稳定关注":
+        return "优先找分歧低吸或二次确认，龙头不弱才考虑跟随"
+    if conclusion == "可跟踪但等确认":
+        return "先看龙头延续和板块扩散，放量确认后再升级"
+    if conclusion == "过热不追":
+        return "只看龙头开板承接，不追加速段"
+    if conclusion == "分歧回避":
+        return "暂不参与，等风险释放后再看"
+    if "先观察" in latest_advice:
+        return "观察为主，等排名、广度、资金同步抬升"
+    return "弱观察，不作为日内优先方向"
+
+
+def _board_posture_text(conclusion):
+    conclusion = str(conclusion or "").strip()
+    mapping = {
+        "持续稳定关注": "板块持续，等承接",
+        "可跟踪但等确认": "板块可跟踪，等确认",
+        "过热不追": "板块过热，等承接",
+        "分歧回避": "板块分歧，先回避",
+        "弱观察": "板块弱观察",
+    }
+    return mapping.get(conclusion, conclusion or "--")
+
+
+def render_markdown(result):
+    lines = [
+        "# 盘中关注池",
+        "",
+        f"- 运行时间: {result.get('run_time')}",
+        f"- 上一完整交易日: {result.get('target_trade_date')}",
+        (
+            f"- 策略范围: 最近{result.get('strategy_lookback_trade_days')}个交易日"
+            f"({result.get('strategy_date')})，命中策略日{result.get('strategy_date_count')}个，"
+            f"策略数: {result.get('strategy_count')}"
+        ),
+        (
+            f"- 行业主报告: {result.get('industry_date')}，行业龙头候选: "
+            f"{result.get('leader_candidate_count')}"
+        ),
+        (
+            f"- 行业近几日比较: {', '.join(result.get('industry_review_dates') or []) or '--'}，"
+            f"覆盖板块: {result.get('board_review_count')}"
+        ),
+        f"- 龙头变化跟踪: {result.get('leader_transition_count')}条板块龙头历史",
+        f"- 实时行情覆盖: {result.get('quote_count')}/{result.get('candidate_count')}",
+        f"- 大盘: {_market_text(result.get('market'))}",
+    ]
+    if result.get("warnings"):
+        lines.append(f"- 提醒: {'；'.join(result.get('warnings') or [])}")
+    lines.append("")
+    if result.get("top_board_reviews"):
+        lines.append("## 板块研判")
+        lines.append("")
+        lines.append("|板块|结论|稳定分|出现|热/关|龙头延续|操作口径|")
+        lines.append("|---|---|---:|---|---|---|---|")
+        for item in result.get("top_board_reviews") or []:
+            lines.append(
+                "|{board}|{conclusion}|{score}|{appear}|热{hot}/关{attention}|{leaders}|{advice}|".format(
+                    board=_md_cell(item.get("board_name")),
+                    conclusion=_md_cell(item.get("conclusion")),
+                    score=item.get("score") if item.get("score") is not None else "--",
+                    appear=f"{item.get('appear_days')}/{item.get('total_days')}",
+                    hot=item.get("latest_hot_rank") if item.get("latest_hot_rank") is not None else "--",
+                    attention=item.get("latest_attention_rank") if item.get("latest_attention_rank") is not None else "--",
+                    leaders=_md_cell(item.get("leader_summary")),
+                    advice=_md_cell(_board_review_advice(item)),
+                )
+            )
+        lines.append("")
+    if result.get("leader_focus_rows"):
+        lines.append("## 新晋龙头观察")
+        lines.append("")
+        lines.append("|代码|名称|板块|龙头变化|板块口径|现价|涨幅|操作口径|")
+        lines.append("|---|---|---|---|---|---:|---:|---|")
+        for row in result.get("leader_focus_rows") or []:
+            lines.append(
+                "|{code}|{name}|{board}|{change}|{conclusion}|{current}|{pct}|{advice}|".format(
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    board=_md_cell(row.get("board_name")),
+                    change=_md_cell(
+                        f"{row.get('leader_transition_label') or '--'}"
+                        f"({row.get('leader_rank_text') or '--'})"
+                    ),
+                    conclusion=_md_cell(_board_posture_text(row.get("board_conclusion"))),
+                    current=row.get("current") if row.get("current") is not None else "--",
+                    pct=f"{row.get('change_pct')}%" if row.get("change_pct") is not None else "--",
+                    advice=_md_cell(row.get("leader_transition_advice")),
+                )
+            )
+        lines.append("")
+    lines.append(
+        "|排名|代码|名称|层级|来源|分数|现价|涨幅|板块口径|龙头变化|盘中|建议|触发|放弃|提醒|"
+    )
+    lines.append("|---:|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|---|")
+    for idx, row in enumerate(result.get("rows") or [], start=1):
+        lines.append(
+            "|{idx}|{code}|{name}|{level}|{sources}|{score}|{current}|{change}|{board_conclusion}|{leader_change}|{state}|{action}|{trigger}|{invalid}|{warnings}|".format(
+                idx=idx,
+                code=_md_cell(row.get("stock_code")),
+                name=_md_cell(row.get("stock_name")),
+                level=_md_cell(row.get("level")),
+                sources=_md_cell(row.get("sources")),
+                score=row.get("score") if row.get("score") is not None else "--",
+                current=row.get("current") if row.get("current") is not None else "--",
+                change=f"{row.get('change_pct')}%" if row.get("change_pct") is not None else "--",
+                board_conclusion=_md_cell(_board_posture_text(row.get("board_conclusion"))),
+                leader_change=_md_cell(
+                    f"{row.get('leader_transition_label') or '--'}"
+                    f"({row.get('leader_rank_text') or '--'})"
+                    if row.get("leader_transition_label") and row.get("leader_transition_label") != "--"
+                    else "--"
+                ),
+                state=_md_cell(row.get("state")),
+                action=_md_cell(row.get("action")),
+                trigger=_md_cell(row.get("trigger")),
+                invalid=_md_cell(row.get("invalid")),
+                warnings=_md_cell(row.get("warnings")),
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def save_report(markdown, run_time=None):
+    now = run_time or dt.datetime.now()
+    date_dir = INTRADAY_REPORT_DIR / now.strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = date_dir / "intraday_focus_latest.md"
+    for old_path in date_dir.glob("intraday_focus_*.md"):
+        if old_path != latest_path:
+            old_path.unlink()
+    latest_path.write_text(markdown, encoding="utf-8")
+    return latest_path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="盘中分析昨日策略落盘和行业热点，输出今日关注池")
+    parser.add_argument("--trade-date", default=None, help="上一完整交易日，默认取今天以前最新历史日")
+    parser.add_argument("--strategy-date", default=None, help="指定单日策略落盘日期；不填则取近20个交易日策略池")
+    parser.add_argument("--industry-date", default=None, help="行业热点主报告日期，默认取昨天，若无日志则回退到更早")
+    parser.add_argument("--use-latest-history", action="store_true", help="允许使用库中最新历史日，包括今天")
+    parser.add_argument("--use-latest-strategy", action="store_true", help="策略日无落盘时回退到最近策略日")
+    parser.add_argument("--top", type=int, default=20, help="输出前N只")
+    parser.add_argument("--board-limit", type=int, default=25, help="最多纳入前N个热点板块")
+    parser.add_argument("--leaders-per-board", type=int, default=3, help="每个热点板块最多纳入N个龙头")
+    parser.add_argument(
+        "--strategy-lookback-trade-days",
+        type=int,
+        default=DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS,
+        help="策略池回看最近N个交易日",
+    )
+    parser.add_argument(
+        "--industry-review-days",
+        type=int,
+        default=DEFAULT_INDUSTRY_REVIEW_DAYS,
+        help="行业热点近几日比较最多回看N份日志",
+    )
+    parser.add_argument("--json", action="store_true", help="输出JSON")
+    parser.add_argument("--no-save", action="store_true", help="不保存Markdown报告")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    result = build_intraday_focus(
+        trade_date=args.trade_date,
+        strategy_date=args.strategy_date,
+        industry_date=args.industry_date,
+        use_latest_history=args.use_latest_history,
+        use_latest_strategy=args.use_latest_strategy,
+        top=args.top,
+        board_limit=args.board_limit,
+        leaders_per_board=args.leaders_per_board,
+        strategy_lookback_trade_days=args.strategy_lookback_trade_days,
+        industry_review_days=args.industry_review_days,
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+        return
+
+    markdown = render_markdown(result)
+    print(markdown)
+    if not args.no_save:
+        output_path = save_report(markdown)
+        print(f"报告已覆盖: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
