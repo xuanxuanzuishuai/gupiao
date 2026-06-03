@@ -14,7 +14,9 @@
 """
 
 import argparse
+import contextlib
 import datetime as dt
+import io
 import json
 import math
 import re
@@ -23,6 +25,8 @@ from pathlib import Path
 import pandas as pd
 import pymysql
 import requests
+
+from analysis_gu_piao_adaptive_risk import overlay as event_overlay
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -53,6 +57,44 @@ LEADER_TYPE_SCORE = {
 }
 DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS = 20
 DEFAULT_INDUSTRY_REVIEW_DAYS = 5
+DEFAULT_EVENT_LOOKBACK_DAYS = 14
+DEFAULT_EVENT_SCAN_LIMIT = 25
+EVENT_RISK_PATTERNS = [
+    ("终止重大资产重组", 10.0, True),
+    ("终止筹划重大资产重组", 10.0, True),
+    ("终止收购", 6.0, False),
+    ("终止购买资产", 6.0, False),
+    ("严重异常波动", 8.0, True),
+    ("停牌核查", 8.0, True),
+    ("立案", 10.0, True),
+    ("处罚", 8.0, True),
+    ("监管", 5.0, False),
+    ("问询", 5.0, False),
+    ("诉讼", 5.0, False),
+    ("冻结", 5.0, False),
+    ("风险提示", 5.0, False),
+    ("异常波动", 3.0, False),
+    ("减持", 4.0, False),
+    ("预亏", 6.0, True),
+    ("亏损", 4.0, False),
+]
+EVENT_POSITIVE_PATTERNS = [
+    ("预增", 2.0),
+    ("扭亏", 2.5),
+    ("中标", 1.5),
+    ("签订合同", 1.5),
+    ("重大合同", 2.0),
+    ("回购", 1.5),
+    ("增持", 1.5),
+]
+EVENT_NEGATIVE_CATALYST_PHRASES = [
+    "不生产",
+    "不涉及",
+    "无规模化",
+    "暂停状态",
+    "紧急澄清",
+    "澄清",
+]
 
 
 def _date_text(value):
@@ -88,6 +130,17 @@ def _to_float(value):
         return float(text)
     except ValueError:
         return None
+
+
+def _to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None or pd.isna(value):
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    return text in {"1", "true", "t", "yes", "y", "是", "高"}
 
 
 def _round(value, digits=2):
@@ -260,6 +313,71 @@ def _load_strategy_candidates(
     frame["strategy_date_text"] = frame["trade_date"].apply(_date_text)
     frame["strategy_age_trade_days"] = frame["strategy_date_text"].map(age_map)
     return frame
+
+
+def _latest_risk_overlay_date(max_date):
+    max_date = _date_text(max_date)
+    if not max_date:
+        return None
+    frame = _query_frame(
+        """
+        SELECT MAX(trade_date) AS trade_date
+        FROM a_stock_risk_overlay
+        WHERE trade_date <= %s
+        """,
+        [max_date],
+    )
+    if frame.empty:
+        return None
+    return _date_text(frame["trade_date"].iloc[0])
+
+
+def _load_risk_overlay_for_codes(stock_codes, trade_date):
+    codes = sorted({code for code in (_normalize_code(value) for value in stock_codes or []) if code})
+    if not codes:
+        return None, {}
+    resolved_date = _latest_risk_overlay_date(trade_date)
+    if not resolved_date:
+        return None, {}
+
+    placeholders = ", ".join(["%s"] * len(codes))
+    frame = _query_frame(
+        f"""
+        SELECT
+            trade_date,
+            stock_code,
+            stock_name,
+            special_pool,
+            special_pool_label,
+            special_pool_tags,
+            risk_overlay_score,
+            risk_overlay_level,
+            risk_overlay_labels,
+            risk_overlay_block_formal,
+            risk_overlay_downgrade,
+            risk_overlay_action,
+            risk_overlay_note,
+            market_regime_label,
+            fundamental_status,
+            event_status,
+            fundamental_note,
+            event_note,
+            lhb_note,
+            unlock_note
+        FROM a_stock_risk_overlay
+        WHERE trade_date = %s
+          AND stock_code IN ({placeholders})
+        """,
+        [resolved_date, *codes],
+    )
+    if frame.empty:
+        return resolved_date, {}
+    frame["stock_code"] = frame["stock_code"].apply(_normalize_code)
+    return resolved_date, {
+        row["stock_code"]: row
+        for row in frame.to_dict("records")
+        if row.get("stock_code")
+    }
 
 
 def _industry_dir_for_date(trade_date):
@@ -829,6 +947,376 @@ def _fetch_market_summary():
     return indices
 
 
+def _quiet_call(func, *args, **kwargs):
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        return func(*args, **kwargs)
+
+
+def _event_date_range(lookback_days):
+    end_ts = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+    begin_ts = end_ts - pd.Timedelta(days=int(lookback_days or DEFAULT_EVENT_LOOKBACK_DAYS))
+    return begin_ts, end_ts
+
+
+def _event_dt(value):
+    parsed = pd.to_datetime(value, errors="coerce")
+    return None if pd.isna(parsed) else parsed
+
+
+def _event_item_date(value):
+    parsed = _event_dt(value)
+    if parsed is None:
+        return None
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _load_notice_items(ak, stock_code, begin_ts, end_ts, max_items=8):
+    try:
+        frame = _quiet_call(
+            ak.stock_individual_notice_report,
+            security=stock_code,
+            symbol="全部",
+            begin_date=begin_ts.strftime("%Y%m%d"),
+            end_date=end_ts.strftime("%Y%m%d"),
+        )
+    except Exception as error:
+        return [], f"公告获取失败:{error}"
+    if frame is None or frame.empty:
+        return [], "近期开奖公告为空"
+
+    title_col = "公告标题" if "公告标题" in frame.columns else None
+    if title_col is None:
+        title_candidates = [column for column in frame.columns if "标题" in str(column) or "名称" in str(column)]
+        title_col = title_candidates[0] if title_candidates else frame.columns[min(2, len(frame.columns) - 1)]
+    type_col = "公告类型" if "公告类型" in frame.columns else None
+    date_col = "公告日期" if "公告日期" in frame.columns else None
+    url_col = "网址" if "网址" in frame.columns else None
+
+    data = frame.copy()
+    if date_col:
+        data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
+        data = data[(data[date_col] >= begin_ts) & (data[date_col] <= end_ts)].copy()
+        data = data.sort_values(date_col, ascending=False)
+    items = []
+    for _, row in data.head(int(max_items or 8)).iterrows():
+        title = str(row.get(title_col) or "").strip()
+        if not title:
+            continue
+        items.append(
+            {
+                "kind": "公告",
+                "date": _event_item_date(row.get(date_col)) if date_col else None,
+                "title": title,
+                "content": "",
+                "type": str(row.get(type_col) or "").strip() if type_col else "",
+                "source": "东方财富公告",
+                "url": row.get(url_col) if url_col else None,
+            }
+        )
+    return items, f"公告{len(items)}条"
+
+
+def _load_news_items(ak, stock_code, begin_ts, end_ts, max_items=8):
+    try:
+        frame = _quiet_call(ak.stock_news_em, symbol=stock_code)
+    except Exception as error:
+        return [], f"新闻获取失败:{error}"
+    if frame is None or frame.empty:
+        return [], "近阶段新闻为空"
+
+    title_col = "新闻标题" if "新闻标题" in frame.columns else None
+    content_col = "新闻内容" if "新闻内容" in frame.columns else None
+    date_col = "发布时间" if "发布时间" in frame.columns else None
+    source_col = "文章来源" if "文章来源" in frame.columns else None
+    url_col = "新闻链接" if "新闻链接" in frame.columns else None
+    if title_col is None:
+        title_candidates = [column for column in frame.columns if "标题" in str(column)]
+        title_col = title_candidates[0] if title_candidates else frame.columns[0]
+
+    data = frame.copy()
+    if date_col:
+        data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
+        data = data[(data[date_col] >= begin_ts) & (data[date_col] <= end_ts)].copy()
+        data = data.sort_values(date_col, ascending=False)
+    items = []
+    for _, row in data.head(int(max_items or 8)).iterrows():
+        title = str(row.get(title_col) or "").strip()
+        if not title:
+            continue
+        items.append(
+            {
+                "kind": "新闻",
+                "date": _event_item_date(row.get(date_col)) if date_col else None,
+                "title": title,
+                "content": str(row.get(content_col) or "").strip() if content_col else "",
+                "type": "",
+                "source": str(row.get(source_col) or "东方财富新闻").strip() if source_col else "东方财富新闻",
+                "url": row.get(url_col) if url_col else None,
+            }
+        )
+    return items, f"新闻{len(items)}条"
+
+
+def _dedupe_event_items(items):
+    seen = set()
+    unique = []
+    for item in items:
+        key = (item.get("date"), item.get("title"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _match_event_text(text):
+    text = _clean_event_text(text)
+    catalyst_hits = event_overlay._match_event_catalysts(text)
+    risk_labels = []
+    risk_score = 0.0
+    block_formal = False
+    positive_score = 0.0
+    for keyword, score, hard_block in EVENT_RISK_PATTERNS:
+        if keyword in text:
+            risk_score += score
+            block_formal = block_formal or hard_block
+            risk_labels.append(keyword)
+    for keyword, score in EVENT_POSITIVE_PATTERNS:
+        if keyword in text:
+            positive_score += score
+    if any(phrase in text for phrase in EVENT_NEGATIVE_CATALYST_PHRASES):
+        catalyst_hits = [
+            hit
+            for hit in catalyst_hits
+            if hit.get("label") not in {"战略合作/题材", "产能释放"}
+        ]
+        risk_score += 3.0
+        risk_labels.append("题材澄清")
+    return catalyst_hits, risk_labels, risk_score, block_formal, positive_score
+
+
+def _is_company_specific_event_item(item, stock_code, stock_name=None):
+    if (item or {}).get("kind") == "公告":
+        return True
+    title = str((item or {}).get("title") or "")
+    name = str(stock_name or "").strip()
+    code = _normalize_code(stock_code)
+    return bool((name and name in title) or (code and code in title))
+
+
+def _clean_event_text(text):
+    text = str(text or "")
+    patterns = [
+        r"免责声明[:：]?\s*本文基于AI生产[^。；\n]*[。；]?",
+        r"本文基于AI生产[^。；\n]*[。；]?",
+        r"不构成任何投资建议",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    return text
+
+
+def _build_event_context(stock_code, stock_name=None, lookback_days=DEFAULT_EVENT_LOOKBACK_DAYS):
+    begin_ts, end_ts = _event_date_range(lookback_days)
+    try:
+        import akshare as ak
+    except Exception as error:
+        return {
+            "status": "akshare_unavailable",
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "note": f"akshare不可用:{error}",
+            "items": [],
+            "event_catalyst": event_overlay._build_event_catalyst_summary([], 0.0),
+            "risk_score": 0.0,
+            "positive_score": 0.0,
+            "risk_labels": [],
+            "block_formal": False,
+        }
+
+    notice_items, notice_note = _load_notice_items(ak, stock_code, begin_ts, end_ts)
+    news_items, news_note = _load_news_items(ak, stock_code, begin_ts, end_ts)
+    items = _dedupe_event_items([*notice_items, *news_items])
+
+    catalyst_hits = []
+    catalyst_score = 0.0
+    risk_score = 0.0
+    positive_score = 0.0
+    risk_labels = []
+    block_formal = False
+    matched_items = []
+    for item in items:
+        if not _is_company_specific_event_item(item, stock_code, stock_name=stock_name):
+            continue
+        text = " ".join(
+            str(part or "")
+            for part in [item.get("title"), item.get("content"), item.get("type"), item.get("source")]
+        )
+        matched, item_risk_labels, item_risk_score, item_block, item_positive_score = _match_event_text(text)
+        if matched:
+            item["catalysts"] = [match.get("label") for match in matched if match.get("label")]
+            for match in matched:
+                catalyst_score += _to_float(match.get("score")) or 0.0
+                catalyst_hits.append(
+                    {
+                        **match,
+                        "date": item.get("date"),
+                        "title": item.get("title"),
+                        "source": item.get("source"),
+                        "kind": item.get("kind"),
+                    }
+                )
+        if item_risk_labels:
+            item["risk_labels"] = item_risk_labels
+        if matched or item_risk_labels or item_positive_score:
+            matched_items.append(item)
+        risk_labels.extend(item_risk_labels)
+        risk_score += item_risk_score
+        positive_score += item_positive_score
+        block_formal = block_formal or item_block
+
+    risk_labels = list(dict.fromkeys(risk_labels))
+    catalyst_summary = event_overlay._build_event_catalyst_summary(catalyst_hits, catalyst_score)
+    latest = (matched_items or items or [{}])[0]
+    note_bits = [
+        f"近{lookback_days}日",
+        notice_note,
+        news_note,
+    ]
+    if latest:
+        note_bits.append(f"最新:{latest.get('date') or '--'} {latest.get('title') or '--'}")
+    if risk_labels:
+        note_bits.append(f"风险:{'、'.join(risk_labels[:5])}")
+    if catalyst_summary.get("primary"):
+        note_bits.append(f"催化:{catalyst_summary.get('level')}/{catalyst_summary.get('primary')}")
+
+    return {
+        "status": "ok",
+        "stock_code": stock_code,
+        "stock_name": stock_name,
+        "note": "；".join(note_bits),
+        "items": items[:12],
+        "latest_item": latest,
+        "event_catalyst": catalyst_summary,
+        "risk_score": round(min(risk_score, 30.0), 2),
+        "positive_score": round(min(positive_score + (catalyst_summary.get("score") or 0.0), 12.0), 2),
+        "risk_labels": risk_labels[:10],
+        "block_formal": bool(block_formal),
+    }
+
+
+def _event_adjustment(context):
+    if not context:
+        return 0.0, [], []
+    catalyst = context.get("event_catalyst") or {}
+    level = str(catalyst.get("level") or "无")
+    primary = catalyst.get("primary")
+    risk_score = _to_float(context.get("risk_score")) or 0.0
+    positive_score = _to_float(context.get("positive_score")) or 0.0
+    block_formal = bool(context.get("block_formal"))
+    score = 0.0
+    reasons = []
+    warnings = []
+
+    if primary and level == "强":
+        score += 10
+        reasons.append(f"强事件催化:{primary}")
+    elif primary and level == "中":
+        score += 6
+        reasons.append(f"中事件催化:{primary}")
+    elif primary and level == "弱":
+        score += 3
+        reasons.append(f"弱事件催化:{primary}")
+    elif positive_score > 0:
+        score += min(3, positive_score)
+        reasons.append("公告/新闻偏正面")
+
+    if block_formal:
+        score -= 25
+        warnings.append("硬风险事件")
+    elif risk_score >= 8:
+        score -= 14
+        warnings.append("事件风险较高")
+    elif risk_score >= 4:
+        score -= 8
+        warnings.append("事件风险需降级")
+    elif risk_score > 0:
+        score -= 3
+        warnings.append("事件风险提醒")
+
+    labels = context.get("risk_labels") or []
+    if labels:
+        warnings.append("事件风险:" + "、".join(labels[:4]))
+    return round(score, 2), reasons, warnings
+
+
+def _event_display(context):
+    if not context:
+        return "--"
+    catalyst = context.get("event_catalyst") or {}
+    primary = catalyst.get("primary")
+    if primary:
+        return f"{catalyst.get('level') or '--'}:{primary}"
+    labels = context.get("risk_labels") or []
+    if labels:
+        return "风险:" + "、".join(labels[:2])
+    if context.get("status") == "ok":
+        return "无明确催化"
+    return context.get("status") or "--"
+
+
+def _event_trade_note(context):
+    if not context:
+        return "--"
+    catalyst = context.get("event_catalyst") or {}
+    if catalyst.get("trade_note"):
+        return catalyst.get("trade_note")
+    labels = context.get("risk_labels") or []
+    if labels:
+        return "事件风险存在，先降级看承接"
+    return "未识别出明确事件催化，按盘面和板块处理"
+
+
+def _append_text(existing, additions):
+    bits = [] if not existing or existing == "--" else str(existing).split("；")
+    bits.extend(additions or [])
+    bits = [bit for bit in bits if bit and bit != "--"]
+    return "；".join(dict.fromkeys(bits)) or "--"
+
+
+def _apply_event_context_to_rows(rows, event_contexts):
+    updated = []
+    for row in rows:
+        row = dict(row)
+        context = event_contexts.get(row.get("stock_code"))
+        adjustment, reasons, warnings = _event_adjustment(context)
+        if context:
+            row["score"] = round((_to_float(row.get("score")) or 0.0) + adjustment, 2)
+            row["reasons"] = _append_text(row.get("reasons"), reasons)
+            row["warnings"] = _append_text(row.get("warnings"), warnings)
+            row["event_display"] = _event_display(context)
+            row["event_note"] = context.get("note")
+            row["event_trade_note"] = _event_trade_note(context)
+            row["event_risk_labels"] = "、".join(context.get("risk_labels") or [])
+            row["event_level"] = (context.get("event_catalyst") or {}).get("level")
+            row["event_primary"] = (context.get("event_catalyst") or {}).get("primary")
+            row["event_latest_title"] = (context.get("latest_item") or {}).get("title")
+            row["event_latest_date"] = (context.get("latest_item") or {}).get("date")
+            row["event_status"] = context.get("status")
+        else:
+            row.setdefault("event_display", "--")
+            row.setdefault("event_note", "--")
+            row.setdefault("event_trade_note", "--")
+            row.setdefault("event_risk_labels", "")
+            row.setdefault("event_level", None)
+            row.setdefault("event_primary", None)
+            row.setdefault("event_latest_title", None)
+            row.setdefault("event_latest_date", None)
+            row.setdefault("event_status", "not_scanned")
+        updated.append(row)
+    return updated
+
+
 def _add_candidate(candidates, code, name=None):
     code = _normalize_code(code)
     if not code:
@@ -1133,6 +1621,93 @@ def _limit_up_pct(stock_code, stock_name=None):
     return 10.0
 
 
+def _risk_overlay_labels(overlay):
+    labels = str((overlay or {}).get("risk_overlay_labels") or "").strip()
+    if labels in {"", "无明显特殊池风险", "nan", "None"}:
+        return ""
+    return labels
+
+
+def _risk_overlay_adjustment(overlay):
+    if not overlay:
+        return {
+            "score": 0.0,
+            "reasons": [],
+            "warnings": [],
+            "block": False,
+            "downgrade": False,
+            "high": False,
+            "level": None,
+            "risk_score": None,
+        }
+
+    risk_score = _to_float(overlay.get("risk_overlay_score")) or 0.0
+    level = str(overlay.get("risk_overlay_level") or "").strip()
+    labels = _risk_overlay_labels(overlay) or "风险覆盖提示"
+    block = _to_bool(overlay.get("risk_overlay_block_formal"))
+    downgrade = _to_bool(overlay.get("risk_overlay_downgrade"))
+    high = bool(block or level == "高" or risk_score >= 8)
+    score = 0.0
+    reasons = []
+    warnings = []
+
+    if block:
+        score -= 38
+        warnings.append(f"风险覆盖硬拦截:{labels}")
+    elif high:
+        score -= 28
+        warnings.append(f"风险覆盖高风险:{labels}")
+    elif downgrade or level == "中" or risk_score >= 4:
+        score -= 16
+        warnings.append(f"风险覆盖降级:{labels}")
+    elif risk_score > 0:
+        score -= 5
+        warnings.append(f"风险覆盖提醒:{labels}")
+    elif level == "低":
+        reasons.append("风险覆盖低风险")
+
+    special_pool = str(overlay.get("special_pool_label") or "").strip()
+    if special_pool and special_pool not in {"普通股票池", "normal"} and special_pool not in labels:
+        warnings.append(f"特殊池:{special_pool}")
+
+    return {
+        "score": round(score, 2),
+        "reasons": reasons,
+        "warnings": warnings,
+        "block": block,
+        "downgrade": bool(downgrade or level == "中" or risk_score >= 4),
+        "high": high,
+        "level": level or None,
+        "risk_score": risk_score,
+    }
+
+
+def _cap_level_by_risk(level, action, risk_adjustment):
+    if not risk_adjustment:
+        return level, action
+    if risk_adjustment.get("block"):
+        return "回避", "风险覆盖硬拦截，不开新仓；持仓只看承接和风控线"
+    if risk_adjustment.get("high"):
+        return "回避", "风险覆盖高风险，先回避普通买点"
+    if risk_adjustment.get("downgrade") and level in {"核心盯盘", "重点关注"}:
+        return "二级观察", "风险覆盖降级，只观察承接确认，不主动追买"
+    return level, action
+
+
+def _risk_overlay_display(overlay):
+    if not overlay:
+        return "--"
+    labels = _risk_overlay_labels(overlay)
+    level = str(overlay.get("risk_overlay_level") or "").strip()
+    if _to_bool(overlay.get("risk_overlay_block_formal")):
+        return f"硬拦截:{labels or level or '--'}"
+    if _to_bool(overlay.get("risk_overlay_downgrade")):
+        return f"降级:{labels or level or '--'}"
+    if labels:
+        return f"{level or '风险'}:{labels}"
+    return level or "--"
+
+
 def _score_candidate(candidate, quote, board_lookup=None, board_review=None, leader_transition_lookup=None):
     strategy = candidate.get("strategy") or {}
     strategies = candidate.get("strategies") or []
@@ -1145,6 +1720,8 @@ def _score_candidate(candidate, quote, board_lookup=None, board_review=None, lea
     score = 0.0
     reasons = []
     warnings = []
+    risk_overlay = candidate.get("risk_overlay") or {}
+    risk_adjustment = _risk_overlay_adjustment(risk_overlay)
 
     if strategy:
         strategy_score, strategy_reasons, strategy_warnings = _score_strategy_context(strategy, strategies)
@@ -1198,14 +1775,20 @@ def _score_candidate(candidate, quote, board_lookup=None, board_review=None, lea
             score -= 3
             warnings.append("成交过度集中")
 
+    score += risk_adjustment["score"]
+    reasons.extend(risk_adjustment["reasons"])
+    warnings.extend(risk_adjustment["warnings"])
+
     if not quote:
         level = "二级观察" if score >= 55 else "暂不关注"
+        action = "无法盘中确认，先不升级关注"
+        level, action = _cap_level_by_risk(level, action, risk_adjustment)
         intention, trigger, invalid = _build_trade_texts("无实时行情", level, strategy, quote)
         return {
             "score": round(score, 2),
             "level": level,
             "state": "无实时行情",
-            "action": "无法盘中确认，先不升级关注",
+            "action": action,
             "intention": intention,
             "trigger": trigger,
             "invalid": invalid,
@@ -1221,6 +1804,13 @@ def _score_candidate(candidate, quote, board_lookup=None, board_review=None, lea
             "leader_transition_advice": leader_transition_score["advice"],
             "leader_rank_text": leader_transition_score["rank_text"],
             "leader_appear_days": (leader_transition or {}).get("appear_days"),
+            "risk_overlay_score": risk_overlay.get("risk_overlay_score"),
+            "risk_overlay_level": risk_overlay.get("risk_overlay_level"),
+            "risk_overlay_labels": risk_overlay.get("risk_overlay_labels"),
+            "risk_overlay_action": risk_overlay.get("risk_overlay_action"),
+            "risk_overlay_display": _risk_overlay_display(risk_overlay),
+            "risk_overlay_block_formal": risk_adjustment.get("block"),
+            "risk_overlay_downgrade": risk_adjustment.get("downgrade"),
         }
 
     current = _to_float(quote.get("current"))
@@ -1334,6 +1924,7 @@ def _score_candidate(candidate, quote, board_lookup=None, board_review=None, lea
     else:
         level = "暂不关注"
         action = "暂不关注，除非快速收回关键位"
+    level, action = _cap_level_by_risk(level, action, risk_adjustment)
     intention, trigger, invalid = _build_trade_texts(state, level, strategy, quote)
 
     return {
@@ -1357,6 +1948,13 @@ def _score_candidate(candidate, quote, board_lookup=None, board_review=None, lea
         "leader_transition_advice": leader_transition_score["advice"],
         "leader_rank_text": leader_transition_score["rank_text"],
         "leader_appear_days": (leader_transition or {}).get("appear_days"),
+        "risk_overlay_score": risk_overlay.get("risk_overlay_score"),
+        "risk_overlay_level": risk_overlay.get("risk_overlay_level"),
+        "risk_overlay_labels": risk_overlay.get("risk_overlay_labels"),
+        "risk_overlay_action": risk_overlay.get("risk_overlay_action"),
+        "risk_overlay_display": _risk_overlay_display(risk_overlay),
+        "risk_overlay_block_formal": risk_adjustment.get("block"),
+        "risk_overlay_downgrade": risk_adjustment.get("downgrade"),
     }
 
 
@@ -1415,6 +2013,8 @@ def build_intraday_focus(
     leaders_per_board=3,
     strategy_lookback_trade_days=DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS,
     industry_review_days=DEFAULT_INDUSTRY_REVIEW_DAYS,
+    event_scan_limit=DEFAULT_EVENT_SCAN_LIMIT,
+    event_lookback_days=DEFAULT_EVENT_LOOKBACK_DAYS,
 ):
     warnings = []
     target_trade_date = _date_text(trade_date) or _latest_history_date(before_today=not use_latest_history)
@@ -1470,6 +2070,23 @@ def build_intraday_focus(
     )
     candidates = _merge_candidates(strategy_frame, leader_frame)
     stock_codes = [item["stock_code"] for item in candidates]
+    risk_overlay_date, risk_overlay_lookup = _load_risk_overlay_for_codes(stock_codes, target_trade_date)
+    if candidates and not risk_overlay_date:
+        warnings.append("未读取到风险覆盖模型结果，本次不做风险覆盖降级")
+    elif risk_overlay_date and risk_overlay_date != target_trade_date:
+        warnings.append(f"风险覆盖模型最新为 {risk_overlay_date}，早于上一完整交易日 {target_trade_date}")
+    for candidate in candidates:
+        candidate["risk_overlay"] = risk_overlay_lookup.get(candidate.get("stock_code"))
+    risk_overlay_values = list(risk_overlay_lookup.values())
+    risk_overlay_blocked_count = sum(
+        1 for row in risk_overlay_values if _to_bool(row.get("risk_overlay_block_formal"))
+    )
+    risk_overlay_downgrade_count = sum(
+        1 for row in risk_overlay_values if _to_bool(row.get("risk_overlay_downgrade"))
+    )
+    risk_overlay_high_count = sum(
+        1 for row in risk_overlay_values if str(row.get("risk_overlay_level") or "") == "高"
+    )
     quotes = _fetch_sina_quotes(stock_codes)
     market = _fetch_market_summary()
 
@@ -1513,6 +2130,14 @@ def build_intraday_focus(
                 "leader_transition_advice": scored.get("leader_transition_advice"),
                 "leader_rank_text": scored.get("leader_rank_text"),
                 "leader_appear_days": scored.get("leader_appear_days"),
+                "risk_overlay_date": risk_overlay_date,
+                "risk_overlay_score": scored.get("risk_overlay_score"),
+                "risk_overlay_level": scored.get("risk_overlay_level"),
+                "risk_overlay_labels": scored.get("risk_overlay_labels"),
+                "risk_overlay_action": scored.get("risk_overlay_action"),
+                "risk_overlay_display": scored.get("risk_overlay_display"),
+                "risk_overlay_block_formal": scored.get("risk_overlay_block_formal"),
+                "risk_overlay_downgrade": scored.get("risk_overlay_downgrade"),
                 "board_name": (leader or {}).get("板块名称") or _board_name(board),
                 "industry_focus": _industry_label(leader, board=board),
                 "leader_type": (leader or {}).get("龙头类型"),
@@ -1528,14 +2153,60 @@ def build_intraday_focus(
             }
         )
 
+    event_contexts = {}
+    if rows and event_scan_limit and int(event_scan_limit) > 0:
+        scan_frame = pd.DataFrame(rows)
+        scan_frame = scan_frame.sort_values(["score", "change_pct"], ascending=[False, False]).head(
+            int(event_scan_limit)
+        )
+        for scan_row in scan_frame.to_dict("records"):
+            code = scan_row.get("stock_code")
+            if not code or code in event_contexts:
+                continue
+            event_contexts[code] = _build_event_context(
+                code,
+                stock_name=scan_row.get("stock_name"),
+                lookback_days=event_lookback_days,
+            )
+        rows = _apply_event_context_to_rows(rows, event_contexts)
+
     result_frame = pd.DataFrame(rows)
     leader_focus_rows = []
+    event_focus_rows = []
+    risk_focus_rows = []
+    action_sections = _build_action_sections(result_frame, limit=8)
     if not result_frame.empty:
         focus_labels = {"新晋主攻龙头", "新晋龙头", "新龙替旧龙", "龙头排名上升", "新晋但过热", "新晋但分歧"}
         leader_focus_frame = result_frame[result_frame["leader_transition_label"].isin(focus_labels)].copy()
         if not leader_focus_frame.empty:
             leader_focus_frame = leader_focus_frame.sort_values(["score", "change_pct"], ascending=[False, False]).head(10)
             leader_focus_rows = leader_focus_frame.to_dict("records")
+        if "risk_overlay_display" in result_frame.columns:
+            risk_focus_frame = result_frame[
+                result_frame["risk_overlay_block_formal"].fillna(False).astype(bool)
+                | result_frame["risk_overlay_downgrade"].fillna(False).astype(bool)
+                | result_frame["risk_overlay_level"].fillna("").isin(["高", "中"])
+            ].copy()
+            if not risk_focus_frame.empty:
+                risk_focus_frame["_risk_block_sort"] = risk_focus_frame["risk_overlay_block_formal"].fillna(False).astype(int)
+                risk_focus_frame["_risk_downgrade_sort"] = risk_focus_frame["risk_overlay_downgrade"].fillna(False).astype(int)
+                risk_focus_frame["_risk_score_sort"] = risk_focus_frame["risk_overlay_score"].apply(_to_float).fillna(0)
+                risk_focus_frame = risk_focus_frame.sort_values(
+                    ["_risk_block_sort", "_risk_downgrade_sort", "_risk_score_sort", "score"],
+                    ascending=[False, False, False, False],
+                ).head(10)
+                risk_focus_rows = risk_focus_frame.drop(
+                    columns=["_risk_block_sort", "_risk_downgrade_sort", "_risk_score_sort"],
+                    errors="ignore",
+                ).to_dict("records")
+        if "event_display" in result_frame.columns:
+            event_focus_frame = result_frame[
+                (result_frame["event_display"].fillna("--") != "--")
+                & (result_frame["event_display"].fillna("--") != "无明确催化")
+            ].copy()
+            if not event_focus_frame.empty:
+                event_focus_frame = event_focus_frame.sort_values(["score", "change_pct"], ascending=[False, False]).head(10)
+                event_focus_rows = event_focus_frame.to_dict("records")
         result_frame = result_frame.sort_values(["score", "change_pct"], ascending=[False, False]).head(int(top))
 
     return {
@@ -1554,6 +2225,17 @@ def build_intraday_focus(
         "top_board_reviews": top_board_reviews,
         "leader_transition_count": int(len(leader_transition_lookup)),
         "leader_focus_rows": leader_focus_rows,
+        **action_sections,
+        "risk_overlay_date": risk_overlay_date,
+        "risk_overlay_count": int(len(risk_overlay_lookup)),
+        "risk_overlay_blocked_count": int(risk_overlay_blocked_count),
+        "risk_overlay_downgrade_count": int(risk_overlay_downgrade_count),
+        "risk_overlay_high_count": int(risk_overlay_high_count),
+        "risk_focus_rows": risk_focus_rows,
+        "event_scan_limit": int(event_scan_limit or 0),
+        "event_lookback_days": int(event_lookback_days or DEFAULT_EVENT_LOOKBACK_DAYS),
+        "event_context_count": int(len(event_contexts)),
+        "event_focus_rows": event_focus_rows,
         "board_count": int(len(board_lookup)),
         "leader_candidate_count": int(len(leader_frame)),
         "candidate_count": int(len(candidates)),
@@ -1606,6 +2288,137 @@ def _board_posture_text(conclusion):
     return mapping.get(conclusion, conclusion or "--")
 
 
+def _row_get(row, key, default=None):
+    if row is None:
+        return default
+    try:
+        return row.get(key, default)
+    except AttributeError:
+        return default
+
+
+def _row_text(row, *keys):
+    return "；".join(str(_row_get(row, key) or "") for key in keys)
+
+
+def _has_meaningful_event(row):
+    event = str(_row_get(row, "event_display") or "").strip()
+    return bool(event and event not in {"--", "无明确催化"})
+
+
+def _has_event_risk(row):
+    event = str(_row_get(row, "event_display") or "")
+    warnings = str(_row_get(row, "warnings") or "")
+    return event.startswith("风险:") or "事件风险" in warnings or "硬风险事件" in warnings
+
+
+def _is_risk_blocked(row):
+    risk_display = str(_row_get(row, "risk_overlay_display") or "")
+    risk_level = str(_row_get(row, "risk_overlay_level") or "")
+    return bool(
+        _to_bool(_row_get(row, "risk_overlay_block_formal"))
+        or risk_display.startswith("硬拦截")
+        or risk_level == "高"
+    )
+
+
+def _is_risk_downgraded(row):
+    risk_display = str(_row_get(row, "risk_overlay_display") or "")
+    risk_level = str(_row_get(row, "risk_overlay_level") or "")
+    return bool(
+        _to_bool(_row_get(row, "risk_overlay_downgrade"))
+        or risk_display.startswith("降级")
+        or risk_level == "中"
+    )
+
+
+def _is_touch_fade(row):
+    return str(_row_get(row, "state") or "") == "触板回落" or "触板回落" in str(_row_get(row, "warnings") or "")
+
+
+def _action_bucket(row):
+    level = str(_row_get(row, "level") or "")
+    state = str(_row_get(row, "state") or "")
+    board_conclusion = str(_row_get(row, "board_conclusion") or "")
+    if _is_risk_blocked(row) or level == "回避":
+        return "回避"
+    if _is_risk_downgraded(row) or _has_event_risk(row) or _is_touch_fade(row):
+        return "观察"
+    if board_conclusion in {"弱观察", "过热不追", "分歧回避"}:
+        return "观察"
+    if level in {"核心盯盘", "重点关注"} and state in {"盘中强势", "修复走强", "弱修复"}:
+        return "可操作"
+    if level == "二级观察":
+        return "观察"
+    return "放弃"
+
+
+def _action_reason(row):
+    bits = []
+    board_text = _board_posture_text(_row_get(row, "board_conclusion"))
+    if board_text and board_text != "--":
+        bits.append(board_text)
+    leader = str(_row_get(row, "leader_transition_label") or "")
+    if leader and leader != "--":
+        bits.append(leader)
+    event = str(_row_get(row, "event_display") or "")
+    if event and event not in {"--", "无明确催化"}:
+        bits.append(event)
+    risk = str(_row_get(row, "risk_overlay_display") or "")
+    if risk and risk not in {"--", "低"}:
+        bits.append(risk)
+    state = str(_row_get(row, "state") or "")
+    if state:
+        bits.append(state)
+    return "；".join(dict.fromkeys(bits[:4])) or "--"
+
+
+def _avoid_reason(row):
+    risk = str(_row_get(row, "risk_overlay_display") or "")
+    event = str(_row_get(row, "event_display") or "")
+    warnings = str(_row_get(row, "warnings") or "")
+    bits = []
+    if risk and risk != "--":
+        bits.append(risk)
+    if event and event not in {"--", "无明确催化"}:
+        bits.append(event)
+    if warnings and warnings != "--":
+        bits.append(warnings.split("；")[0])
+    return "；".join(dict.fromkeys(bits[:3])) or "--"
+
+
+def _build_action_sections(result_frame, limit=8):
+    if result_frame is None or result_frame.empty:
+        return {
+            "action_group_counts": {},
+            "actionable_rows": [],
+            "observe_rows": [],
+            "avoid_rows": [],
+        }
+
+    frame = result_frame.copy()
+    frame["_action_bucket"] = frame.apply(_action_bucket, axis=1)
+    frame["_sort_change_pct"] = frame["change_pct"].apply(_to_float).fillna(-999)
+    frame["_sort_score"] = frame["score"].apply(_to_float).fillna(-999)
+    frame = frame.sort_values(["_sort_score", "_sort_change_pct"], ascending=[False, False])
+    counts = {
+        bucket: int((frame["_action_bucket"] == bucket).sum())
+        for bucket in ["可操作", "观察", "回避", "放弃"]
+    }
+
+    def rows_for(bucket, row_limit):
+        rows = frame[frame["_action_bucket"] == bucket].head(int(row_limit or limit)).copy()
+        rows = rows.drop(columns=["_action_bucket", "_sort_change_pct", "_sort_score"], errors="ignore")
+        return rows.to_dict("records")
+
+    return {
+        "action_group_counts": counts,
+        "actionable_rows": rows_for("可操作", limit),
+        "observe_rows": rows_for("观察", limit),
+        "avoid_rows": rows_for("回避", limit),
+    }
+
+
 def render_markdown(result):
     lines = [
         "# 盘中关注池",
@@ -1626,12 +2439,97 @@ def render_markdown(result):
             f"覆盖板块: {result.get('board_review_count')}"
         ),
         f"- 龙头变化跟踪: {result.get('leader_transition_count')}条板块龙头历史",
+        (
+            f"- 风险覆盖模型: {result.get('risk_overlay_date') or '--'}，"
+            f"候选覆盖 {result.get('risk_overlay_count')}/{result.get('candidate_count')}，"
+            f"高风险 {result.get('risk_overlay_high_count')}，"
+            f"硬拦截 {result.get('risk_overlay_blocked_count')}，"
+            f"降级 {result.get('risk_overlay_downgrade_count')}"
+        ),
+        (
+            f"- 事件催化扫描: 近{result.get('event_lookback_days')}日，"
+            f"{result.get('event_context_count')}/{result.get('event_scan_limit')}只"
+        ),
         f"- 实时行情覆盖: {result.get('quote_count')}/{result.get('candidate_count')}",
         f"- 大盘: {_market_text(result.get('market'))}",
     ]
     if result.get("warnings"):
         lines.append(f"- 提醒: {'；'.join(result.get('warnings') or [])}")
     lines.append("")
+
+    action_counts = result.get("action_group_counts") or {}
+    if action_counts:
+        lines.append("## 操作分层")
+        lines.append("")
+        lines.append(
+            f"- 可操作: {action_counts.get('可操作', 0)}；"
+            f"观察: {action_counts.get('观察', 0)}；"
+            f"回避: {action_counts.get('回避', 0)}；"
+            f"放弃: {action_counts.get('放弃', 0)}"
+        )
+        lines.append("")
+
+    if result.get("actionable_rows"):
+        lines.append("## 今日可操作候选")
+        lines.append("")
+        lines.append("|代码|名称|层级|理由|现价|涨幅|触发|放弃|")
+        lines.append("|---|---|---|---|---:|---:|---|---|")
+        for row in result.get("actionable_rows") or []:
+            lines.append(
+                "|{code}|{name}|{level}|{reason}|{current}|{pct}|{trigger}|{invalid}|".format(
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    level=_md_cell(row.get("level")),
+                    reason=_md_cell(_action_reason(row)),
+                    current=row.get("current") if row.get("current") is not None else "--",
+                    pct=f"{row.get('change_pct')}%" if row.get("change_pct") is not None else "--",
+                    trigger=_md_cell(row.get("trigger")),
+                    invalid=_md_cell(row.get("invalid")),
+                )
+            )
+        lines.append("")
+    else:
+        lines.append("## 今日可操作候选")
+        lines.append("")
+        lines.append("- 暂无干净的可操作候选，优先观察而不是强行出手。")
+        lines.append("")
+
+    if result.get("observe_rows"):
+        lines.append("## 只观察候选")
+        lines.append("")
+        lines.append("|代码|名称|观察原因|现价|涨幅|操作口径|")
+        lines.append("|---|---|---|---:|---:|---|")
+        for row in result.get("observe_rows") or []:
+            lines.append(
+                "|{code}|{name}|{reason}|{current}|{pct}|{action}|".format(
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    reason=_md_cell(_action_reason(row)),
+                    current=row.get("current") if row.get("current") is not None else "--",
+                    pct=f"{row.get('change_pct')}%" if row.get("change_pct") is not None else "--",
+                    action=_md_cell(row.get("action")),
+                )
+            )
+        lines.append("")
+
+    if result.get("avoid_rows"):
+        lines.append("## 高风险/回避")
+        lines.append("")
+        lines.append("|代码|名称|回避原因|现价|涨幅|口径|")
+        lines.append("|---|---|---|---:|---:|---|")
+        for row in result.get("avoid_rows") or []:
+            lines.append(
+                "|{code}|{name}|{reason}|{current}|{pct}|{action}|".format(
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    reason=_md_cell(_avoid_reason(row)),
+                    current=row.get("current") if row.get("current") is not None else "--",
+                    pct=f"{row.get('change_pct')}%" if row.get("change_pct") is not None else "--",
+                    action=_md_cell(row.get("action")),
+                )
+            )
+        lines.append("")
+
     if result.get("top_board_reviews"):
         lines.append("## 板块研判")
         lines.append("")
@@ -1673,13 +2571,49 @@ def render_markdown(result):
                 )
             )
         lines.append("")
+    if result.get("risk_focus_rows"):
+        lines.append("## 风险覆盖观察")
+        lines.append("")
+        lines.append("|代码|名称|风控|分数|处理口径|盘中|")
+        lines.append("|---|---|---|---:|---|---|")
+        for row in result.get("risk_focus_rows") or []:
+            lines.append(
+                "|{code}|{name}|{risk}|{risk_score}|{action}|{state}|".format(
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    risk=_md_cell(row.get("risk_overlay_display")),
+                    risk_score=row.get("risk_overlay_score") if row.get("risk_overlay_score") is not None else "--",
+                    action=_md_cell(row.get("risk_overlay_action") or row.get("action")),
+                    state=_md_cell(row.get("state")),
+                )
+            )
+        lines.append("")
+    if result.get("event_focus_rows"):
+        lines.append("## 事件催化观察")
+        lines.append("")
+        lines.append("|代码|名称|事件|最新来源|交易口径|")
+        lines.append("|---|---|---|---|---|")
+        for row in result.get("event_focus_rows") or []:
+            latest = " ".join(
+                part for part in [row.get("event_latest_date"), row.get("event_latest_title")] if part
+            )
+            lines.append(
+                "|{code}|{name}|{event}|{latest}|{note}|".format(
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    event=_md_cell(row.get("event_display")),
+                    latest=_md_cell(latest or row.get("event_note")),
+                    note=_md_cell(row.get("event_trade_note")),
+                )
+            )
+        lines.append("")
     lines.append(
-        "|排名|代码|名称|层级|来源|分数|现价|涨幅|板块口径|龙头变化|盘中|建议|触发|放弃|提醒|"
+        "|排名|代码|名称|层级|来源|分数|现价|涨幅|板块口径|龙头变化|事件|风控|盘中|建议|触发|放弃|提醒|"
     )
-    lines.append("|---:|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|---|")
+    lines.append("|---:|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|---|---|---|")
     for idx, row in enumerate(result.get("rows") or [], start=1):
         lines.append(
-            "|{idx}|{code}|{name}|{level}|{sources}|{score}|{current}|{change}|{board_conclusion}|{leader_change}|{state}|{action}|{trigger}|{invalid}|{warnings}|".format(
+            "|{idx}|{code}|{name}|{level}|{sources}|{score}|{current}|{change}|{board_conclusion}|{leader_change}|{event}|{risk}|{state}|{action}|{trigger}|{invalid}|{warnings}|".format(
                 idx=idx,
                 code=_md_cell(row.get("stock_code")),
                 name=_md_cell(row.get("stock_name")),
@@ -1695,6 +2629,8 @@ def render_markdown(result):
                     if row.get("leader_transition_label") and row.get("leader_transition_label") != "--"
                     else "--"
                 ),
+                event=_md_cell(row.get("event_display") or "--"),
+                risk=_md_cell(row.get("risk_overlay_display") or "--"),
                 state=_md_cell(row.get("state")),
                 action=_md_cell(row.get("action")),
                 trigger=_md_cell(row.get("trigger")),
@@ -1739,6 +2675,18 @@ def parse_args():
         default=DEFAULT_INDUSTRY_REVIEW_DAYS,
         help="行业热点近几日比较最多回看N份日志",
     )
+    parser.add_argument(
+        "--event-scan-limit",
+        type=int,
+        default=DEFAULT_EVENT_SCAN_LIMIT,
+        help="对初筛前N只补充公告/新闻事件催化；0表示关闭",
+    )
+    parser.add_argument(
+        "--event-lookback-days",
+        type=int,
+        default=DEFAULT_EVENT_LOOKBACK_DAYS,
+        help="公告/新闻事件回看天数",
+    )
     parser.add_argument("--json", action="store_true", help="输出JSON")
     parser.add_argument("--no-save", action="store_true", help="不保存Markdown报告")
     return parser.parse_args()
@@ -1757,6 +2705,8 @@ def main():
         leaders_per_board=args.leaders_per_board,
         strategy_lookback_trade_days=args.strategy_lookback_trade_days,
         industry_review_days=args.industry_review_days,
+        event_scan_limit=args.event_scan_limit,
+        event_lookback_days=args.event_lookback_days,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
