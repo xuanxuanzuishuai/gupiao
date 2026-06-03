@@ -1,13 +1,13 @@
 """盘中关注池分析。
 
 作用:
-    读取近20个交易日的策略落库结果和上一完整交易日行业热点报告，
+    读取近20个交易日的策略落库结果和当前分析交易日行业热点报告，
     同时比较近几日行业热点延续性，盘中拉取实时行情，
     输出今天值得关注、只观察或应回避的个股。它只做临时判断，不写入
     a_stock_analysis_history，避免污染收盘模型和回测。
 
 流程:
-    先确定上一完整交易日；
+    先确定库里最新分析交易日；
     再读取 a_stock_strategy_result 和 log/industry_hotspot/YYYY-MM-DD；
     然后批量请求 Sina 实时行情；
     最后按策略来源、行业热度、龙头身份和盘中承接状态综合排序。
@@ -222,20 +222,14 @@ def _query_frame(sql, params=None):
         connection.close()
 
 
-def _latest_history_date(before_today=True):
-    today = dt.date.today().strftime("%Y-%m-%d")
+def _latest_history_date():
     where = "WHERE CHAR_LENGTH(last_data_date) = 10 AND last_data_date BETWEEN '2000-01-01' AND '2100-12-31'"
-    params = []
-    if before_today:
-        where += " AND last_data_date < %s"
-        params.append(today)
     frame = _query_frame(
         f"""
         SELECT MAX(last_data_date) AS trade_date
         FROM a_stock_analysis_history
         {where}
         """,
-        params,
     )
     if frame.empty:
         return None
@@ -437,10 +431,6 @@ def _industry_dir_for_date(trade_date):
     if not dirs:
         return None
     return sorted(dirs, key=lambda item: item[0])[-1][1]
-
-
-def _default_industry_date():
-    return (dt.date.today() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def _recent_industry_dirs(end_date, review_days=DEFAULT_INDUSTRY_REVIEW_DAYS):
@@ -2579,7 +2569,6 @@ def build_intraday_focus(
     trade_date=None,
     strategy_date=None,
     industry_date=None,
-    use_latest_history=False,
     use_latest_strategy=False,
     top=20,
     board_limit=25,
@@ -2590,9 +2579,9 @@ def build_intraday_focus(
     event_lookback_days=DEFAULT_EVENT_LOOKBACK_DAYS,
 ):
     warnings = []
-    target_trade_date = _date_text(trade_date) or _latest_history_date(before_today=not use_latest_history)
+    target_trade_date = _date_text(trade_date) or _latest_history_date()
     if not target_trade_date:
-        raise RuntimeError("无法确定上一完整交易日")
+        raise RuntimeError("无法确定分析交易日")
 
     requested_strategy_date = _date_text(strategy_date)
     strategy_frame = _load_strategy_candidates(
@@ -2613,7 +2602,7 @@ def build_intraday_focus(
     elif strategy_frame.empty:
         warnings.append(f"{resolved_strategy_date} 无策略落盘，本次只用行业热点龙头观察")
 
-    resolved_industry_date = _date_text(industry_date) or _default_industry_date()
+    resolved_industry_date = _date_text(industry_date) or target_trade_date
     industry_dir, boards, leaders = _load_industry_reports(resolved_industry_date)
     if industry_dir:
         resolved_industry_date = industry_dir.name
@@ -2647,7 +2636,7 @@ def build_intraday_focus(
     if candidates and not risk_overlay_date:
         warnings.append("未读取到风险覆盖模型结果，本次不做风险覆盖降级")
     elif risk_overlay_date and risk_overlay_date != target_trade_date:
-        warnings.append(f"风险覆盖模型最新为 {risk_overlay_date}，早于上一完整交易日 {target_trade_date}")
+        warnings.append(f"风险覆盖模型最新为 {risk_overlay_date}，早于分析交易日 {target_trade_date}")
     for candidate in candidates:
         candidate["risk_overlay"] = risk_overlay_lookup.get(candidate.get("stock_code"))
     risk_overlay_values = list(risk_overlay_lookup.values())
@@ -3046,7 +3035,7 @@ def render_markdown(result):
         "# 盘中关注池",
         "",
         f"- 运行时间: {result.get('run_time')}",
-        f"- 上一完整交易日: {result.get('target_trade_date')}",
+        f"- 分析交易日: {result.get('target_trade_date')}",
         (
             f"- 策略范围: 最近{result.get('strategy_lookback_trade_days')}个交易日"
             f"({result.get('strategy_date')})，命中策略日{result.get('strategy_date_count')}个，"
@@ -3649,11 +3638,10 @@ def save_report(markdown, trade_date=None, run_time=None):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="盘中分析昨日策略落盘和行业热点，输出今日关注池")
-    parser.add_argument("--trade-date", default=None, help="上一完整交易日，默认取今天以前最新历史日")
+    parser = argparse.ArgumentParser(description="盘中分析库里最新交易日的策略落盘和行业热点，输出今日关注池")
+    parser.add_argument("--trade-date", default=None, help="分析交易日；默认取库里最新交易日")
     parser.add_argument("--strategy-date", default=None, help="指定单日策略落盘日期；不填则取近20个交易日策略池")
-    parser.add_argument("--industry-date", default=None, help="行业热点主报告日期，默认取昨天，若无日志则回退到更早")
-    parser.add_argument("--use-latest-history", action="store_true", help="允许使用库中最新历史日，包括今天")
+    parser.add_argument("--industry-date", default=None, help="行业热点主报告日期；默认同分析交易日，若无日志则回退到更早")
     parser.add_argument("--use-latest-strategy", action="store_true", help="策略日无落盘时回退到最近策略日")
     parser.add_argument("--top", type=int, default=20, help="输出前N只")
     parser.add_argument("--board-limit", type=int, default=25, help="最多纳入前N个热点板块")
@@ -3693,7 +3681,6 @@ def main():
         trade_date=args.trade_date,
         strategy_date=args.strategy_date,
         industry_date=args.industry_date,
-        use_latest_history=args.use_latest_history,
         use_latest_strategy=args.use_latest_strategy,
         top=args.top,
         board_limit=args.board_limit,
