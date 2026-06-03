@@ -66,6 +66,8 @@ def run_adaptive_model_workflow(
         end_date=effective_end_date,
         tail_trade_days=history_tail_trade_days,
         columns=shared_history_columns,
+        chunked=True,
+        progress_label=f"{SHORT_TERM_MODEL_DISPLAY}历史读取",
     )
     shared_trade_days = (
         int(shared_history["last_data_date"].dropna().nunique())
@@ -216,6 +218,8 @@ def run_adaptive_model_workflow(
                 end_date=effective_end_date,
                 tail_trade_days=adaptive_backtest_context_trade_days,
                 columns=SHORT_TERM_FRAME_COLUMNS,
+                chunked=True,
+                progress_label=f"{ADAPTIVE_HEALTH_MODEL_DISPLAY}walk-forward上下文读取",
             )
             backtest_history_prepared = False
             backtest_loaded_trade_days = (

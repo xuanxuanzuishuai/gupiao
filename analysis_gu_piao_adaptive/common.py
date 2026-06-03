@@ -1268,17 +1268,25 @@ def _load_history(start_date=None, end_date=None, tail_trade_days=None, columns=
             params.append(end_date)
 
     use_chunked_query = bool(chunked)
+    if progress_label:
+        _emit_runtime_status(f"{progress_label}: 查询开始")
     history = _query_frame(
         sql,
         params=params,
         chunksize=LONG_RUNWAY_HISTORY_QUERY_CHUNK_SIZE if use_chunked_query else None,
         progress_label=progress_label if use_chunked_query else None,
     )
+    if progress_label:
+        _emit_runtime_status(f"{progress_label}: 查询完成 rows={len(history)}")
 
     if history.empty:
         return history
 
+    if progress_label:
+        _emit_runtime_status(f"{progress_label}: 清洗开始 rows={len(history)}")
     history = _prepare_common_frame(history, dedupe_keys=("last_data_date", "stock_code"))
+    if progress_label:
+        _emit_runtime_status(f"{progress_label}: 清洗完成 rows={len(history)}")
     if history.empty:
         return history
 

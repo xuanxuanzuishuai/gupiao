@@ -15,6 +15,7 @@
 
 import get_gu_piao_info
 import analysis_industry_hotspot
+import analysis_intraday_focus
 import analysis_gu_piao_adaptive_risk_overlay_model as risk_overlay
 from analysis_gu_piao_data_print_result import analysis_gu_piao_data, clear_daily_strategy_results
 from analysis_gu_piao_history_adaptive_model import (
@@ -128,6 +129,35 @@ def require_risk_overlay_ready(risk_overlay_summary, target_trade_date):
         )
 
 
+def build_intraday_focus_report(target_trade_date):
+    target_trade_date = _normalize_trade_date_text(target_trade_date)
+    result = analysis_intraday_focus.build_intraday_focus(
+        trade_date=target_trade_date,
+        industry_date=target_trade_date,
+    )
+    markdown = analysis_intraday_focus.render_markdown(result)
+    output_path = analysis_intraday_focus.save_report(markdown, trade_date=result.get("target_trade_date"))
+    action_counts = result.get("action_group_counts") or {}
+    print(
+        "盘中关注池报告: "
+        f"output_path={output_path}, "
+        f"candidate_count={result.get('candidate_count')}, "
+        f"可操作={action_counts.get('可操作', 0)}, "
+        f"观察={action_counts.get('观察', 0)}, "
+        f"回避={action_counts.get('回避', 0)}, "
+        f"放弃={action_counts.get('放弃', 0)}",
+        flush=True,
+    )
+    return {
+        "success": True,
+        "output_path": str(output_path),
+        "candidate_count": result.get("candidate_count"),
+        "action_group_counts": action_counts,
+        "target_trade_date": result.get("target_trade_date"),
+        "industry_date": result.get("industry_date"),
+    }
+
+
 if __name__ == "__main__":
     fetch_summary = run_stage("抓取个股行情与历史入库", get_gu_piao_info.get_gu_piao_info)
 
@@ -176,6 +206,15 @@ if __name__ == "__main__":
         f"report_path={industry_output_paths.get('report_path') or '--'}, "
         f"board_csv={industry_output_paths.get('board_csv_path') or '--'}, "
         f"leader_csv={industry_output_paths.get('leader_csv_path') or '--'}",
+        flush=True,
+    )
+    intraday_focus_summary = run_stage(
+        "盘中关注池报告",
+        build_intraday_focus_report,
+        target_trade_date,
+    )
+    print(
+        f"盘中关注池最新报告: {intraday_focus_summary.get('output_path') or '--'}",
         flush=True,
     )
     # long_runway_summary = run_stage(
