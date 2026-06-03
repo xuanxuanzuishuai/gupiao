@@ -137,10 +137,14 @@ def build_intraday_focus_report(target_trade_date):
     )
     markdown = analysis_intraday_focus.render_markdown(result)
     output_path = analysis_intraday_focus.save_report(markdown, trade_date=result.get("target_trade_date"))
+    html_output_path = output_path.with_suffix(".html")
+    stable_html_path = analysis_intraday_focus.INTRADAY_REPORT_DIR / "intraday_focus_latest.html"
     action_counts = result.get("action_group_counts") or {}
     print(
         "盘中关注池报告: "
         f"output_path={output_path}, "
+        f"html_path={html_output_path}, "
+        f"stable_html_path={stable_html_path}, "
         f"candidate_count={result.get('candidate_count')}, "
         f"可操作={action_counts.get('可操作', 0)}, "
         f"观察={action_counts.get('观察', 0)}, "

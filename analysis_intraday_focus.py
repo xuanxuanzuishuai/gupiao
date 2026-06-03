@@ -16,6 +16,7 @@
 import argparse
 import contextlib
 import datetime as dt
+import html
 import io
 import json
 import math
@@ -3274,6 +3275,355 @@ def render_markdown(result):
     return "\n".join(lines) + "\n"
 
 
+def _split_markdown_table_row(line):
+    text = str(line or "").strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    return [part.strip() for part in text.split("|")]
+
+
+def _is_markdown_table_align(line):
+    cells = _split_markdown_table_row(line)
+    if not cells:
+        return False
+    return all(re.match(r"^:?-{3,}:?$", cell or "") for cell in cells)
+
+
+def _html_text(value):
+    return html.escape(str(value if value is not None else "--"), quote=True)
+
+
+def _html_cell_class(text, header=None):
+    text = str(text or "")
+    header = str(header or "")
+    classes = []
+    if header in {"涨幅", "今日均涨", "5日均涨", "5日超额"} and re.search(r"^-?\d+(?:\.\d+)?%$", text):
+        value = _to_float(text)
+        if value is not None and value > 0:
+            classes.append("num-up")
+        elif value is not None and value < 0:
+            classes.append("num-down")
+    positive_words = ["可操作", "核心盯盘", "重点关注", "主升延续", "扩散发酵", "梯队强", "承接强", "封板近似强"]
+    observe_words = ["观察", "稳定观察", "修复承接", "C题材观察", "D弱相关", "触板回落", "冲高回落"]
+    risk_words = ["回避", "硬拦截", "风险", "分歧退潮", "高潮加速", "炸板", "承接弱", "跌破"]
+    if any(word in text for word in risk_words):
+        classes.append("tag-risk")
+    elif any(word in text for word in positive_words):
+        classes.append("tag-good")
+    elif any(word in text for word in observe_words):
+        classes.append("tag-watch")
+    if header in {"代码", "现价", "涨幅", "分数", "稳定分"}:
+        classes.append("nowrap")
+    return " ".join(dict.fromkeys(classes))
+
+
+def _render_markdown_table(header_line, rows):
+    headers = _split_markdown_table_row(header_line)
+    body_rows = [
+        _split_markdown_table_row(row)
+        for row in rows
+        if row.strip().startswith("|") and not _is_markdown_table_align(row)
+    ]
+    output = ['<div class="table-wrap"><table>']
+    output.append("<thead><tr>")
+    for header in headers:
+        output.append(f"<th>{_html_text(header)}</th>")
+    output.append("</tr></thead><tbody>")
+    for row in body_rows:
+        output.append("<tr>")
+        for index, cell in enumerate(row):
+            header = headers[index] if index < len(headers) else ""
+            class_text = _html_cell_class(cell, header=header)
+            class_attr = f' class="{class_text}"' if class_text else ""
+            output.append(f"<td{class_attr} data-label=\"{_html_text(header)}\">{_html_text(cell)}</td>")
+        output.append("</tr>")
+    output.append("</tbody></table></div>")
+    return "\n".join(output)
+
+
+def _markdown_to_html(markdown):
+    lines = str(markdown or "").splitlines()
+    output = []
+    in_list = False
+    index = 0
+
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            output.append("</ul>")
+            in_list = False
+
+    while index < len(lines):
+        line = lines[index].rstrip()
+        stripped = line.strip()
+        if not stripped:
+            close_list()
+            index += 1
+            continue
+        if stripped.startswith("|") and index + 1 < len(lines) and _is_markdown_table_align(lines[index + 1]):
+            close_list()
+            table_rows = []
+            header_line = stripped
+            index += 2
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                table_rows.append(lines[index].strip())
+                index += 1
+            output.append(_render_markdown_table(header_line, table_rows))
+            continue
+        if stripped.startswith("# "):
+            close_list()
+            output.append(f"<h1>{_html_text(stripped[2:].strip())}</h1>")
+        elif stripped.startswith("## "):
+            close_list()
+            title = stripped[3:].strip()
+            anchor = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", title).strip("-")
+            output.append(f'<section class="report-section" id="{_html_text(anchor)}">')
+            output.append(f"<h2>{_html_text(title)}</h2>")
+            output.append("</section>")
+        elif stripped.startswith("- "):
+            if not in_list:
+                output.append('<ul class="summary-list">')
+                in_list = True
+            output.append(f"<li>{_html_text(stripped[2:].strip())}</li>")
+        else:
+            close_list()
+            output.append(f"<p>{_html_text(stripped)}</p>")
+        index += 1
+    close_list()
+    return "\n".join(output)
+
+
+def render_html_report(markdown, title="盘中关注池"):
+    body_html = _markdown_to_html(markdown)
+    title_text = _html_text(title)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title_text}</title>
+<style>
+:root {{
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #172033;
+  --muted: #657083;
+  --line: #d9dee8;
+  --soft: #eef2f7;
+  --red: #c53030;
+  --red-bg: #fff1f1;
+  --green: #087f5b;
+  --green-bg: #ecfdf5;
+  --amber: #946200;
+  --amber-bg: #fff7db;
+  --blue: #155e9f;
+  --blue-bg: #eef6ff;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+}}
+.topbar {{
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 22px;
+  background: rgba(255, 255, 255, 0.94);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(10px);
+}}
+.top-actions {{
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}}
+.brand {{
+  font-weight: 700;
+  letter-spacing: 0;
+  white-space: nowrap;
+}}
+.refresh-status {{
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}}
+.search {{
+  width: min(420px, 48vw);
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 12px;
+  color: var(--text);
+  background: #fff;
+  outline: none;
+}}
+.search:focus {{
+  border-color: #7aa7d9;
+  box-shadow: 0 0 0 3px rgba(21, 94, 159, 0.12);
+}}
+main {{
+  max-width: 1680px;
+  margin: 0 auto;
+  padding: 22px;
+}}
+h1 {{
+  margin: 4px 0 14px;
+  font-size: 26px;
+  line-height: 1.25;
+  letter-spacing: 0;
+}}
+.summary-list {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+  gap: 8px;
+  margin: 0 0 20px;
+  padding: 0;
+  list-style: none;
+}}
+.summary-list li {{
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--muted);
+}}
+.report-section {{
+  margin-top: 24px;
+  padding-top: 2px;
+  border-top: 1px solid var(--line);
+}}
+h2 {{
+  margin: 0 0 10px;
+  padding-top: 10px;
+  font-size: 18px;
+  line-height: 1.3;
+  letter-spacing: 0;
+}}
+p {{
+  margin: 10px 0;
+  color: var(--muted);
+}}
+.table-wrap {{
+  width: 100%;
+  overflow: auto;
+  margin: 8px 0 22px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}}
+table {{
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  min-width: 980px;
+}}
+thead th {{
+  background: #f0f3f8;
+  color: #374151;
+  font-weight: 700;
+  text-align: left;
+}}
+th, td {{
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid #edf0f5;
+  vertical-align: top;
+}}
+th:last-child, td:last-child {{ border-right: 0; }}
+tbody tr:nth-child(even) td {{ background: #fbfcfe; }}
+tbody tr:hover td {{ background: #eef6ff; }}
+.nowrap {{ white-space: nowrap; }}
+.num-up {{ color: var(--red); font-weight: 700; }}
+.num-down {{ color: var(--green); font-weight: 700; }}
+.tag-good, .tag-watch, .tag-risk {{
+  font-weight: 650;
+}}
+.tag-good {{ color: var(--red); background: var(--red-bg); }}
+.tag-watch {{ color: var(--amber); background: var(--amber-bg); }}
+.tag-risk {{ color: var(--green); background: var(--green-bg); }}
+tr.hidden {{ display: none; }}
+@media (max-width: 760px) {{
+  .topbar {{
+    align-items: stretch;
+    flex-direction: column;
+    padding: 10px 14px;
+  }}
+  .top-actions {{
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }}
+  .refresh-status {{ white-space: normal; }}
+  .search {{ width: 100%; }}
+  main {{ padding: 14px; }}
+  h1 {{ font-size: 22px; }}
+  .summary-list {{ grid-template-columns: 1fr; }}
+  th, td {{ padding: 8px; }}
+}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">{title_text}</div>
+  <div class="top-actions">
+    <span class="refresh-status" id="refreshStatus">检查更新中</span>
+    <input class="search" id="tableSearch" type="search" placeholder="搜索代码、名称、板块、风险">
+  </div>
+</header>
+<main id="reportRoot">
+{body_html}
+</main>
+<script>
+const input = document.getElementById('tableSearch');
+input.addEventListener('input', () => {{
+  const keyword = input.value.trim().toLowerCase();
+  document.querySelectorAll('tbody tr').forEach(row => {{
+    row.classList.toggle('hidden', keyword && !row.innerText.toLowerCase().includes(keyword));
+  }});
+}});
+const refreshStatus = document.getElementById('refreshStatus');
+let reportSignature = null;
+async function checkReportUpdate() {{
+  try {{
+    const url = new URL(window.location.href);
+    url.searchParams.set('_check', Date.now().toString());
+    const response = await fetch(url.toString(), {{ method: 'HEAD', cache: 'no-store' }});
+    const signature = response.headers.get('last-modified') || response.headers.get('etag') || '';
+    const now = new Date().toLocaleTimeString('zh-CN', {{ hour12: false }});
+    if (reportSignature && signature && signature !== reportSignature) {{
+      refreshStatus.textContent = '报告已更新，刷新中';
+      window.location.reload();
+      return;
+    }}
+    if (!reportSignature && signature) {{
+      reportSignature = signature;
+    }}
+    refreshStatus.textContent = `自动检查 ${{now}}`;
+  }} catch (error) {{
+    refreshStatus.textContent = '自动检查失败';
+  }}
+}}
+checkReportUpdate();
+setInterval(checkReportUpdate, 30000);
+</script>
+</body>
+</html>
+"""
+
+
 def save_report(markdown, trade_date=None, run_time=None):
     trade_date_text = _date_text(trade_date)
     now = run_time or dt.datetime.now()
@@ -3281,10 +3631,20 @@ def save_report(markdown, trade_date=None, run_time=None):
     date_dir = INTRADAY_REPORT_DIR / date_dir_name
     date_dir.mkdir(parents=True, exist_ok=True)
     latest_path = date_dir / "intraday_focus_latest.md"
+    latest_html_path = date_dir / "intraday_focus_latest.html"
+    stable_latest_path = INTRADAY_REPORT_DIR / "intraday_focus_latest.md"
+    stable_latest_html_path = INTRADAY_REPORT_DIR / "intraday_focus_latest.html"
     for old_path in date_dir.glob("intraday_focus_*.md"):
         if old_path != latest_path:
             old_path.unlink()
+    for old_path in date_dir.glob("intraday_focus_*.html"):
+        if old_path != latest_html_path:
+            old_path.unlink()
     latest_path.write_text(markdown, encoding="utf-8")
+    html_report = render_html_report(markdown)
+    latest_html_path.write_text(html_report, encoding="utf-8")
+    stable_latest_path.write_text(markdown, encoding="utf-8")
+    stable_latest_html_path.write_text(html_report, encoding="utf-8")
     return latest_path
 
 
