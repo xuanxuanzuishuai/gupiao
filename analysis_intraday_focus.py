@@ -1920,6 +1920,21 @@ def _safe_price_text(label, value):
     return f"{label}{value}" if value is not None else None
 
 
+def _price_zone_text(label, low, high=None):
+    low = _round(low, 2)
+    high = _round(high if high is not None else low, 2)
+    if low is None and high is None:
+        return None
+    if low is None:
+        return f"{label}{high}"
+    if high is None:
+        return f"{label}{low}"
+    zone_low, zone_high = sorted([low, high])
+    if zone_low == zone_high:
+        return f"{label}{zone_low}"
+    return f"{label}{zone_low}-{zone_high}"
+
+
 def _build_trade_texts(state, level, strategy, quote):
     current = _to_float((quote or {}).get("current"))
     prev_close = _to_float((quote or {}).get("prev_close"))
@@ -1936,7 +1951,20 @@ def _build_trade_texts(state, level, strategy, quote):
     ]
     supports = [item for item in supports if item]
     support_text = " / ".join(supports[:2]) or "--"
+    support_values = [
+        value for value in [stop_price, prev_close, open_price] if _to_float(value) is not None
+    ]
+    support_zone_text = (
+        _price_zone_text("支撑区", min(support_values[:2]), max(support_values[:2]))
+        if support_values
+        else support_text
+    )
     high_text = _safe_price_text("日高", day_high) or "--"
+    chase_zone_text = (
+        _price_zone_text("高位区间", day_high * 0.985, day_high)
+        if day_high is not None
+        else "--"
+    )
     weak_lines = [
         _safe_price_text("防守", stop_price),
         _safe_price_text("昨低", ref_low),
@@ -1950,7 +1978,7 @@ def _build_trade_texts(state, level, strategy, quote):
         return "等承接", f"不追；等重新站回{high_text}，或回踩不破{support_text}后再看", f"跌回{weak_text}或反抽不过{high_text}"
     if level in {"核心盯盘", "重点关注"}:
         if current is not None and day_high is not None and current >= day_high * 0.985:
-            trigger = f"不追现价；等回踩不破{support_text}后再突破{high_text}"
+            trigger = f"{chase_zone_text}不追；等回踩{support_zone_text}不破，或放量突破{high_text}再看"
         else:
             trigger = f"站稳{support_text}，并放量重新上攻{high_text}"
         invalid = f"跌回{weak_text}或冲高回落不收回昨收"
@@ -2565,6 +2593,23 @@ def _industry_label(leader, board=None):
     )
 
 
+def _short_industry_label(value, limit=3):
+    parts = [
+        part.strip()
+        for part in re.split(r"[,，/、;；]+", str(value or ""))
+        if part and part.strip()
+    ]
+    parts = list(dict.fromkeys(parts))
+    return " / ".join(parts[: int(limit or 3)]) or "--"
+
+
+def _candidate_board_display(strategy=None, leader=None, board=None):
+    board_name = str((leader or {}).get("板块名称") or _board_name(board) or "").strip()
+    if board_name:
+        return board_name
+    return _short_industry_label((strategy or {}).get("industry"))
+
+
 def build_intraday_focus(
     trade_date=None,
     strategy_date=None,
@@ -2715,6 +2760,8 @@ def build_intraday_focus(
                 "risk_overlay_block_formal": scored.get("risk_overlay_block_formal"),
                 "risk_overlay_downgrade": scored.get("risk_overlay_downgrade"),
                 "board_name": (leader or {}).get("板块名称") or _board_name(board),
+                "board_display": _candidate_board_display(strategy, leader, board),
+                "strategy_industry": strategy.get("industry") if strategy else None,
                 "industry_focus": _industry_label(leader, board=board),
                 "leader_type": (leader or {}).get("龙头类型"),
                 "key_levels": scored["key_levels"],
@@ -3084,13 +3131,14 @@ def render_markdown(result):
     if result.get("actionable_rows"):
         lines.append("## 今日可操作候选")
         lines.append("")
-        lines.append("|代码|名称|层级|理由|题材周期|盘口|现价|涨幅|触发|放弃|")
-        lines.append("|---|---|---|---|---|---|---:|---:|---|---|")
+        lines.append("|代码|名称|板块|层级|理由|题材周期|盘口|现价|涨幅|触发|放弃|")
+        lines.append("|---|---|---|---|---|---|---|---:|---:|---|---|")
         for row in result.get("actionable_rows") or []:
             lines.append(
-                "|{code}|{name}|{level}|{reason}|{cycle}|{quality}|{current}|{pct}|{trigger}|{invalid}|".format(
+                "|{code}|{name}|{board}|{level}|{reason}|{cycle}|{quality}|{current}|{pct}|{trigger}|{invalid}|".format(
                     code=_md_cell(row.get("stock_code")),
                     name=_md_cell(row.get("stock_name")),
+                    board=_md_cell(row.get("board_display") or row.get("board_name")),
                     level=_md_cell(row.get("level")),
                     reason=_md_cell(_action_reason(row)),
                     cycle=_md_cell(row.get("theme_lifecycle")),
@@ -3111,13 +3159,14 @@ def render_markdown(result):
     if result.get("observe_rows"):
         lines.append("## 只观察候选")
         lines.append("")
-        lines.append("|代码|名称|观察原因|盘口|现价|涨幅|操作口径|")
-        lines.append("|---|---|---|---|---:|---:|---|")
+        lines.append("|代码|名称|板块|观察原因|盘口|现价|涨幅|操作口径|")
+        lines.append("|---|---|---|---|---|---:|---:|---|")
         for row in result.get("observe_rows") or []:
             lines.append(
-                "|{code}|{name}|{reason}|{quality}|{current}|{pct}|{action}|".format(
+                "|{code}|{name}|{board}|{reason}|{quality}|{current}|{pct}|{action}|".format(
                     code=_md_cell(row.get("stock_code")),
                     name=_md_cell(row.get("stock_name")),
+                    board=_md_cell(row.get("board_display") or row.get("board_name")),
                     reason=_md_cell(_action_reason(row)),
                     quality=_md_cell(row.get("intraday_quality")),
                     current=row.get("current") if row.get("current") is not None else "--",
@@ -3130,13 +3179,14 @@ def render_markdown(result):
     if result.get("avoid_rows"):
         lines.append("## 高风险/回避")
         lines.append("")
-        lines.append("|代码|名称|回避原因|现价|涨幅|口径|")
-        lines.append("|---|---|---|---:|---:|---|")
+        lines.append("|代码|名称|板块|回避原因|现价|涨幅|口径|")
+        lines.append("|---|---|---|---|---:|---:|---|")
         for row in result.get("avoid_rows") or []:
             lines.append(
-                "|{code}|{name}|{reason}|{current}|{pct}|{action}|".format(
+                "|{code}|{name}|{board}|{reason}|{current}|{pct}|{action}|".format(
                     code=_md_cell(row.get("stock_code")),
                     name=_md_cell(row.get("stock_name")),
+                    board=_md_cell(row.get("board_display") or row.get("board_name")),
                     reason=_md_cell(_avoid_reason(row)),
                     current=row.get("current") if row.get("current") is not None else "--",
                     pct=f"{row.get('change_pct')}%" if row.get("change_pct") is not None else "--",
@@ -3191,13 +3241,14 @@ def render_markdown(result):
     if result.get("risk_focus_rows"):
         lines.append("## 风险覆盖观察")
         lines.append("")
-        lines.append("|代码|名称|风控|分数|处理口径|盘中|")
-        lines.append("|---|---|---|---:|---|---|")
+        lines.append("|代码|名称|板块|风控|分数|处理口径|盘中|")
+        lines.append("|---|---|---|---|---:|---|---|")
         for row in result.get("risk_focus_rows") or []:
             lines.append(
-                "|{code}|{name}|{risk}|{risk_score}|{action}|{state}|".format(
+                "|{code}|{name}|{board}|{risk}|{risk_score}|{action}|{state}|".format(
                     code=_md_cell(row.get("stock_code")),
                     name=_md_cell(row.get("stock_name")),
+                    board=_md_cell(row.get("board_display") or row.get("board_name")),
                     risk=_md_cell(row.get("risk_overlay_display")),
                     risk_score=row.get("risk_overlay_score") if row.get("risk_overlay_score") is not None else "--",
                     action=_md_cell(row.get("risk_overlay_action") or row.get("action")),
@@ -3208,16 +3259,17 @@ def render_markdown(result):
     if result.get("event_focus_rows"):
         lines.append("## 事件催化观察")
         lines.append("")
-        lines.append("|代码|名称|真实性|事件|最新来源|交易口径|")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("|代码|名称|板块|真实性|事件|最新来源|交易口径|")
+        lines.append("|---|---|---|---|---|---|---|")
         for row in result.get("event_focus_rows") or []:
             latest = " ".join(
                 part for part in [row.get("event_latest_date"), row.get("event_latest_title")] if part
             )
             lines.append(
-                "|{code}|{name}|{truth}|{event}|{latest}|{note}|".format(
+                "|{code}|{name}|{board}|{truth}|{event}|{latest}|{note}|".format(
                     code=_md_cell(row.get("stock_code")),
                     name=_md_cell(row.get("stock_name")),
+                    board=_md_cell(row.get("board_display") or row.get("board_name")),
                     truth=_md_cell(row.get("event_truth_display")),
                     event=_md_cell(row.get("event_display")),
                     latest=_md_cell(latest or row.get("event_note")),
@@ -3226,15 +3278,16 @@ def render_markdown(result):
             )
         lines.append("")
     lines.append(
-        "|排名|代码|名称|层级|来源|分数|现价|涨幅|题材|梯队|盘口|龙头变化|事件|风控|建议|触发|放弃|提醒|"
+        "|排名|代码|名称|板块|层级|来源|分数|现价|涨幅|题材|梯队|盘口|龙头变化|事件|风控|建议|触发|放弃|提醒|"
     )
-    lines.append("|---:|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---:|---|---|---|---|---|---:|---:|---:|---|---|---|---|---|---|---|---|---|---|")
     for idx, row in enumerate(result.get("rows") or [], start=1):
         lines.append(
-            "|{idx}|{code}|{name}|{level}|{sources}|{score}|{current}|{change}|{cycle}|{tier}|{quality}|{leader_change}|{event}|{risk}|{action}|{trigger}|{invalid}|{warnings}|".format(
+            "|{idx}|{code}|{name}|{board}|{level}|{sources}|{score}|{current}|{change}|{cycle}|{tier}|{quality}|{leader_change}|{event}|{risk}|{action}|{trigger}|{invalid}|{warnings}|".format(
                 idx=idx,
                 code=_md_cell(row.get("stock_code")),
                 name=_md_cell(row.get("stock_name")),
+                board=_md_cell(row.get("board_display") or row.get("board_name")),
                 level=_md_cell(row.get("level")),
                 sources=_md_cell(row.get("sources")),
                 score=row.get("score") if row.get("score") is not None else "--",
