@@ -682,7 +682,7 @@ def _leader_stability(leaders, board_name):
         ),
     )
     summary_bits = [
-        f"{item['stock_name']}({item['stock_code']}, {item['appear_days']}天)"
+        f"{item['stock_name']}({item['stock_code']}, 龙头持续{item['appear_days']}日)"
         for item in grouped[:3]
     ]
     latest_date = str(frame["_review_date"].max()) if "_review_date" in frame.columns else None
@@ -2878,6 +2878,15 @@ def _market_text(market):
     )
 
 
+def _rank_text(value):
+    value = _to_float(value)
+    if value is None:
+        return "--"
+    if float(value).is_integer():
+        return str(int(value))
+    return str(_round(value, 1))
+
+
 def _md_cell(value):
     text = str(value if value is not None else "--").strip() or "--"
     return text.replace("|", "/").replace("\n", " ")
@@ -3198,19 +3207,19 @@ def render_markdown(result):
     if result.get("top_board_reviews"):
         lines.append("## 板块研判")
         lines.append("")
-        lines.append("|板块|生命周期|梯队|结论|稳定分|出现|热/关|龙头延续|操作口径|")
+        lines.append("|板块|生命周期|梯队|结论|稳定分|出现|排名|龙头延续|操作口径|")
         lines.append("|---|---|---|---|---:|---|---|---|---|")
         for item in result.get("top_board_reviews") or []:
             lines.append(
-                "|{board}|{cycle}|{tier}|{conclusion}|{score}|{appear}|热{hot}/关{attention}|{leaders}|{advice}|".format(
+                "|{board}|{cycle}|{tier}|{conclusion}|{score}|{appear}|热点第{hot} / 关注第{attention}|{leaders}|{advice}|".format(
                     board=_md_cell(item.get("board_name")),
                     cycle=_md_cell(item.get("theme_lifecycle")),
                     tier=_md_cell(item.get("leader_tier_label")),
                     conclusion=_md_cell(item.get("conclusion")),
                     score=item.get("score") if item.get("score") is not None else "--",
                     appear=f"{item.get('appear_days')}/{item.get('total_days')}",
-                    hot=item.get("latest_hot_rank") if item.get("latest_hot_rank") is not None else "--",
-                    attention=item.get("latest_attention_rank") if item.get("latest_attention_rank") is not None else "--",
+                    hot=_rank_text(item.get("latest_hot_rank")),
+                    attention=_rank_text(item.get("latest_attention_rank")),
                     leaders=_md_cell(item.get("leader_summary")),
                     advice=_md_cell(_board_review_advice(item)),
                 )
