@@ -60,6 +60,7 @@ DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS = 20
 DEFAULT_INDUSTRY_REVIEW_DAYS = 5
 DEFAULT_EVENT_LOOKBACK_DAYS = 14
 DEFAULT_EVENT_SCAN_LIMIT = 25
+DEFAULT_HTML_HIDE_CODE_PREFIXES = ("688",)
 EVENT_RISK_PATTERNS = [
     ("终止重大资产重组", 10.0, True),
     ("终止筹划重大资产重组", 10.0, True),
@@ -3370,13 +3371,27 @@ def _html_cell_class(text, header=None):
     return " ".join(dict.fromkeys(classes))
 
 
-def _render_markdown_table(header_line, rows):
+def _markdown_table_row_hidden_by_code(row, headers, hide_code_prefixes=None):
+    prefixes = tuple(str(prefix) for prefix in (hide_code_prefixes or ()) if str(prefix))
+    if not prefixes or "代码" not in headers:
+        return False
+    code_index = headers.index("代码")
+    if code_index >= len(row):
+        return False
+    code = _normalize_code(row[code_index])
+    return bool(code and code.startswith(prefixes))
+
+
+def _render_markdown_table(header_line, rows, hide_code_prefixes=None):
     headers = _split_markdown_table_row(header_line)
-    body_rows = [
-        _split_markdown_table_row(row)
-        for row in rows
-        if row.strip().startswith("|") and not _is_markdown_table_align(row)
-    ]
+    body_rows = []
+    for row_text in rows:
+        if not row_text.strip().startswith("|") or _is_markdown_table_align(row_text):
+            continue
+        row = _split_markdown_table_row(row_text)
+        if _markdown_table_row_hidden_by_code(row, headers, hide_code_prefixes=hide_code_prefixes):
+            continue
+        body_rows.append(row)
     output = ['<div class="table-wrap"><table>']
     output.append("<thead><tr>")
     for header in headers:
@@ -3394,7 +3409,7 @@ def _render_markdown_table(header_line, rows):
     return "\n".join(output)
 
 
-def _markdown_to_html(markdown):
+def _markdown_to_html(markdown, hide_code_prefixes=None):
     lines = str(markdown or "").splitlines()
     output = []
     in_list = False
@@ -3421,7 +3436,13 @@ def _markdown_to_html(markdown):
             while index < len(lines) and lines[index].strip().startswith("|"):
                 table_rows.append(lines[index].strip())
                 index += 1
-            output.append(_render_markdown_table(header_line, table_rows))
+            output.append(
+                _render_markdown_table(
+                    header_line,
+                    table_rows,
+                    hide_code_prefixes=hide_code_prefixes,
+                )
+            )
             continue
         if stripped.startswith("# "):
             close_list()
@@ -3446,8 +3467,8 @@ def _markdown_to_html(markdown):
     return "\n".join(output)
 
 
-def render_html_report(markdown, title="盘中关注池"):
-    body_html = _markdown_to_html(markdown)
+def render_html_report(markdown, title="盘中关注池", hide_code_prefixes=DEFAULT_HTML_HIDE_CODE_PREFIXES):
+    body_html = _markdown_to_html(markdown, hide_code_prefixes=hide_code_prefixes)
     title_text = _html_text(title)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -3675,7 +3696,7 @@ setInterval(checkReportUpdate, 30000);
 """
 
 
-def save_report(markdown, trade_date=None, run_time=None):
+def save_report(markdown, trade_date=None, run_time=None, hide_code_prefixes=DEFAULT_HTML_HIDE_CODE_PREFIXES):
     trade_date_text = _date_text(trade_date)
     now = run_time or dt.datetime.now()
     date_dir_name = trade_date_text or now.strftime("%Y-%m-%d")
@@ -3692,7 +3713,7 @@ def save_report(markdown, trade_date=None, run_time=None):
         if old_path != latest_html_path:
             old_path.unlink()
     latest_path.write_text(markdown, encoding="utf-8")
-    html_report = render_html_report(markdown)
+    html_report = render_html_report(markdown, hide_code_prefixes=hide_code_prefixes)
     latest_html_path.write_text(html_report, encoding="utf-8")
     stable_latest_path.write_text(markdown, encoding="utf-8")
     stable_latest_html_path.write_text(html_report, encoding="utf-8")
@@ -3734,6 +3755,7 @@ def parse_args():
     )
     parser.add_argument("--json", action="store_true", help="输出JSON")
     parser.add_argument("--no-save", action="store_true", help="不保存Markdown报告")
+    parser.add_argument("--show-688-in-html", action="store_true", help="HTML报告显示688开头科创板股票")
     return parser.parse_args()
 
 
@@ -3759,7 +3781,12 @@ def main():
     markdown = render_markdown(result)
     print(markdown)
     if not args.no_save:
-        output_path = save_report(markdown, trade_date=result.get("target_trade_date"))
+        hide_code_prefixes = () if args.show_688_in_html else DEFAULT_HTML_HIDE_CODE_PREFIXES
+        output_path = save_report(
+            markdown,
+            trade_date=result.get("target_trade_date"),
+            hide_code_prefixes=hide_code_prefixes,
+        )
         print(f"报告已覆盖: {output_path}")
 
 
