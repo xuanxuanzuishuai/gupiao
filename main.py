@@ -15,6 +15,7 @@
 
 import get_gu_piao_info
 import analysis_industry_hotspot
+import analysis_emotion_leader_watch
 import analysis_intraday_focus
 import analysis_gu_piao_adaptive_risk_overlay_model as risk_overlay
 from analysis_gu_piao_data_print_result import analysis_gu_piao_data, clear_daily_strategy_results
@@ -210,6 +211,21 @@ if __name__ == "__main__":
         f"report_path={industry_output_paths.get('report_path') or '--'}, "
         f"board_csv={industry_output_paths.get('board_csv_path') or '--'}, "
         f"leader_csv={industry_output_paths.get('leader_csv_path') or '--'}",
+        flush=True,
+    )
+    emotion_watch_summary = run_stage(
+        "情绪龙头胚子池",
+        analysis_emotion_leader_watch.run_emotion_leader_watch,
+        trade_date=target_trade_date,
+        print_report=False,
+    )
+    emotion_output_paths = (emotion_watch_summary or {}).get("output_paths") or {}
+    print(
+        "情绪龙头胚子池: "
+        f"md_path={emotion_output_paths.get('md_path') or '--'}, "
+        f"csv_path={emotion_output_paths.get('csv_path') or '--'}, "
+        f"candidate_count={emotion_watch_summary.get('candidate_count')}, "
+        f"stage_counts={emotion_watch_summary.get('stage_counts') or {}}",
         flush=True,
     )
     intraday_focus_summary = run_stage(

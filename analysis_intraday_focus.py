@@ -32,6 +32,7 @@ from analysis_gu_piao_adaptive_risk import overlay as event_overlay
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 INTRADAY_REPORT_DIR = PROJECT_ROOT / "log" / "intraday_focus"
+EMOTION_WATCH_DIR = PROJECT_ROOT / "log" / "emotion_leader_watch"
 SINA_REALTIME_URL = "https://hq.sinajs.cn/list={symbols}"
 SINA_HEADERS = {
     "Referer": "https://finance.sina.com.cn",
@@ -60,7 +61,7 @@ DEFAULT_STRATEGY_LOOKBACK_TRADE_DAYS = 20
 DEFAULT_INDUSTRY_REVIEW_DAYS = 5
 DEFAULT_EVENT_LOOKBACK_DAYS = 14
 DEFAULT_EVENT_SCAN_LIMIT = 25
-DEFAULT_HTML_HIDE_CODE_PREFIXES = ("688",)
+DEFAULT_HTML_HIDE_CODE_PREFIXES = ("688", "920")
 EVENT_RISK_PATTERNS = [
     ("终止重大资产重组", 10.0, True),
     ("终止筹划重大资产重组", 10.0, True),
@@ -193,7 +194,12 @@ def _round(value, digits=2):
 def _normalize_code(value):
     text = str(value or "").strip()
     matched = re.search(r"(\d{6})", text)
-    return matched.group(1) if matched else None
+    if matched:
+        return matched.group(1)
+    digits = re.sub(r"\D", "", text)
+    if 1 <= len(digits) <= 6:
+        return digits.zfill(6)
+    return None
 
 
 def _realtime_symbol(stock_code):
@@ -466,6 +472,75 @@ def _load_industry_reports(trade_date):
     boards = _read_csv_if_exists(daily_dir / "industry_hotspot_boards.csv")
     leaders = _read_csv_if_exists(daily_dir / "industry_hotspot_leaders.csv")
     return daily_dir, boards, leaders
+
+
+def _emotion_watch_dir_for_date(trade_date):
+    wanted = _parse_date(trade_date)
+    if not EMOTION_WATCH_DIR.exists():
+        return None
+    dirs = []
+    for child in EMOTION_WATCH_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        parsed = _parse_date(child.name)
+        if not parsed:
+            continue
+        if wanted and parsed > wanted:
+            continue
+        dirs.append((parsed, child))
+    if not dirs:
+        return None
+    return sorted(dirs, key=lambda item: item[0])[-1][1]
+
+
+def _load_emotion_leader_watch(trade_date, limit=10):
+    daily_dir = _emotion_watch_dir_for_date(trade_date)
+    if not daily_dir:
+        return None, [], 0
+
+    frame = _read_csv_if_exists(daily_dir / "emotion_leader_watch_latest.csv")
+    if frame.empty:
+        return daily_dir.name, [], 0
+
+    frame = frame.copy()
+    frame["stock_code"] = frame["stock_code"].apply(_normalize_code)
+    frame = frame[frame["stock_code"].notna()].copy()
+    if frame.empty:
+        return daily_dir.name, [], 0
+
+    stage_order = {"A早期胚子": 1, "B右侧确认": 2, "C龙头已成": 3, "D过热回避": 4, "观察": 5}
+    frame["_stage_order"] = frame["stage"].map(stage_order).fillna(9)
+    frame["_score_sort"] = frame["score"].apply(_to_float).fillna(-999)
+    frame = frame.sort_values(["_stage_order", "_score_sort"], ascending=[True, False])
+    total_count = int(len(frame))
+    if limit:
+        limit = int(limit)
+        selected_frames = []
+        selected_indexes = set()
+        a_rows = frame[frame["stage"] == "A早期胚子"].head(min(6, limit)).copy()
+        if not a_rows.empty:
+            selected_frames.append(a_rows)
+            selected_indexes.update(a_rows.index.tolist())
+        remaining_limit = max(0, limit - len(a_rows))
+        b_cap = 8 if a_rows.empty else 6
+        b_rows = frame[frame["stage"] == "B右侧确认"].head(min(b_cap, remaining_limit)).copy()
+        if not b_rows.empty:
+            selected_frames.append(b_rows)
+            selected_indexes.update(b_rows.index.tolist())
+        if selected_frames:
+            selected = pd.concat(selected_frames, ignore_index=False)
+            if len(selected) < limit:
+                remaining = frame[
+                    (~frame.index.isin(selected_indexes))
+                    & (~frame["stage"].isin(["C龙头已成", "D过热回避", "观察"]))
+                ].head(limit - len(selected))
+                if not remaining.empty:
+                    selected = pd.concat([selected, remaining], ignore_index=False)
+            frame = selected.sort_values(["_stage_order", "_score_sort"], ascending=[True, False]).head(limit).copy()
+        else:
+            frame = frame[~frame["stage"].isin(["C龙头已成", "D过热回避", "观察"])].head(limit).copy()
+    frame = frame.drop(columns=["_stage_order", "_score_sort"], errors="ignore")
+    return daily_dir.name, frame.to_dict("records"), total_count
 
 
 def _load_industry_review(end_date, review_days=DEFAULT_INDUSTRY_REVIEW_DAYS):
@@ -2153,6 +2228,85 @@ def _score_intraday_quality(
     }
 
 
+def _day_position_from_quote(quote):
+    current = _to_float((quote or {}).get("current"))
+    high = _to_float((quote or {}).get("high"))
+    low = _to_float((quote or {}).get("low"))
+    if current is None or high is None or low is None or high <= low:
+        return None
+    return round((current - low) / (high - low) * 100, 2)
+
+
+def _enrich_emotion_watch_rows(rows):
+    rows = [dict(row) for row in (rows or [])]
+    if not rows:
+        return []
+
+    codes = [row.get("stock_code") for row in rows]
+    quotes = _fetch_sina_quotes(codes)
+    enriched = []
+    for row in rows:
+        code = _normalize_code(row.get("stock_code"))
+        quote = quotes.get(code)
+        row["stock_code"] = code
+        if not quote:
+            row.update(
+                {
+                    "current": None,
+                    "change_pct": None,
+                    "quote_datetime": None,
+                    "day_position": None,
+                    "intraday_quality": "无实时行情",
+                    "intraday_quality_score": 0.0,
+                    "limit_quality": "--",
+                    "closing_acceptance": "--",
+                    "touched_limit_up": False,
+                    "limit_fade": False,
+                }
+            )
+            enriched.append(row)
+            continue
+
+        current = _to_float(quote.get("current"))
+        high = _to_float(quote.get("high"))
+        high_from_prev_pct = _to_float(quote.get("high_from_prev_pct"))
+        limit_up_pct = _limit_up_pct(code, quote.get("name") or row.get("stock_name"))
+        touched_limit_up = bool(
+            high_from_prev_pct is not None
+            and high_from_prev_pct >= limit_up_pct - 0.35
+        )
+        limit_fade = bool(touched_limit_up and current is not None and high is not None and current < high * 0.97)
+        day_position = _day_position_from_quote(quote)
+        intraday_quality = _score_intraday_quality(
+            quote,
+            touched_limit_up=touched_limit_up,
+            limit_fade=limit_fade,
+            stop_broken=False,
+            day_position=day_position,
+            amount_ratio=row.get("amount_ratio_5d"),
+            limit_up_pct=limit_up_pct,
+        )
+        row.update(
+            {
+                "stock_name": quote.get("name") or row.get("stock_name"),
+                "current": quote.get("current"),
+                "change_pct": quote.get("change_pct"),
+                "open_gap_pct": quote.get("open_gap_pct"),
+                "day_position": day_position,
+                "quote_datetime": quote.get("quote_datetime"),
+                "intraday_quality": intraday_quality.get("quality"),
+                "intraday_quality_score": intraday_quality.get("score"),
+                "limit_quality": intraday_quality.get("limit_quality"),
+                "closing_acceptance": intraday_quality.get("closing_acceptance"),
+                "touched_limit_up": touched_limit_up,
+                "limit_fade": limit_fade,
+                "intraday_quality_note": intraday_quality.get("quality_note"),
+            }
+        )
+        enriched.append(row)
+    return enriched
+
+
 def _risk_overlay_labels(overlay):
     labels = str((overlay or {}).get("risk_overlay_labels") or "").strip()
     if labels in {"", "无明显特殊池风险", "nan", "None"}:
@@ -2833,6 +2987,16 @@ def build_intraday_focus(
                 event_focus_rows = event_focus_frame.to_dict("records")
         result_frame = result_frame.sort_values(["score", "change_pct"], ascending=[False, False]).head(int(top))
 
+    emotion_watch_date, emotion_watch_rows, emotion_watch_total_count = _load_emotion_leader_watch(
+        target_trade_date,
+        limit=10,
+    )
+    emotion_watch_rows = _enrich_emotion_watch_rows(emotion_watch_rows)
+    if not emotion_watch_date:
+        warnings.append("未找到情绪龙头胚子池报告，盘中页暂不展示该模块")
+    elif not emotion_watch_rows:
+        warnings.append(f"情绪龙头胚子池 {emotion_watch_date} 无候选")
+
     return {
         "success": True,
         "run_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2862,6 +3026,10 @@ def build_intraday_focus(
         "event_focus_rows": event_focus_rows,
         "board_count": int(len(board_lookup)),
         "leader_candidate_count": int(len(leader_frame)),
+        "emotion_watch_date": emotion_watch_date,
+        "emotion_watch_total_count": int(emotion_watch_total_count),
+        "emotion_watch_count": int(len(emotion_watch_rows)),
+        "emotion_watch_rows": emotion_watch_rows,
         "candidate_count": int(len(candidates)),
         "quote_count": int(len(quotes)),
         "market": market,
@@ -2891,6 +3059,16 @@ def _rank_text(value):
 def _md_cell(value):
     text = str(value if value is not None else "--").strip() or "--"
     return text.replace("|", "/").replace("\n", " ")
+
+
+def _md_pct(value):
+    value = _to_float(value)
+    return "--" if value is None else f"{round(value, 2)}%"
+
+
+def _md_num(value, digits=2):
+    value = _to_float(value)
+    return "--" if value is None else str(round(value, digits))
 
 
 def _board_review_advice(item):
@@ -3118,6 +3296,10 @@ def render_markdown(result):
             f"- 事件催化扫描: 近{result.get('event_lookback_days')}日，"
             f"{result.get('event_context_count')}/{result.get('event_scan_limit')}只"
         ),
+        (
+            f"- 情绪龙头胚子池: {result.get('emotion_watch_date') or '--'}，"
+            f"核心展示 {result.get('emotion_watch_count') or 0}/全量{result.get('emotion_watch_total_count') or 0}"
+        ),
         "- 新增研判口径: 事件真实性分级、题材生命周期、板块梯队强弱、盘口质量近似判断",
         f"- 实时行情覆盖: {result.get('quote_count')}/{result.get('candidate_count')}",
         f"- 大盘: {_market_text(result.get('market'))}",
@@ -3164,6 +3346,39 @@ def render_markdown(result):
         lines.append("## 今日可操作候选")
         lines.append("")
         lines.append("- 暂无干净的可操作候选，优先观察而不是强行出手。")
+        lines.append("")
+
+    if result.get("emotion_watch_rows"):
+        lines.append("## 情绪龙头胚子池")
+        lines.append("")
+        lines.append("|阶段|代码|名称|板块|分数|5日|20日|额比|换手|现价|涨幅|盘口|热榜|触发|放弃|")
+        lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|")
+        for row in result.get("emotion_watch_rows") or []:
+            quality = str(row.get("intraday_quality") or "--")
+            limit_quality = str(row.get("limit_quality") or "")
+            if limit_quality and limit_quality not in {"--", "未触板"} and limit_quality not in quality:
+                quality = f"{quality}/{limit_quality}"
+            if _to_bool(row.get("limit_fade")) and "回落" not in quality:
+                quality = f"{quality}/回落"
+            lines.append(
+                "|{stage}|{code}|{name}|{industry}|{score}|{chg5}|{chg20}|{ratio}|{turnover}|{current}|{pct}|{quality}|{leader}|{trigger}|{invalid}|".format(
+                    stage=_md_cell(row.get("stage")),
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    industry=_md_cell(_short_industry_label(row.get("industry"), limit=2)),
+                    score=_md_num(row.get("score")),
+                    chg5=_md_pct(row.get("change_5d")),
+                    chg20=_md_pct(row.get("change_20d")),
+                    ratio=_md_num(row.get("amount_ratio_5d")),
+                    turnover=_md_pct(row.get("turnover_rate")),
+                    current=_md_num(row.get("current")),
+                    pct=_md_pct(row.get("change_pct")),
+                    quality=_md_cell(quality),
+                    leader=_md_cell(row.get("leader_context")),
+                    trigger=_md_cell(row.get("trigger")),
+                    invalid=_md_cell(row.get("invalid")),
+                )
+            )
         lines.append("")
 
     if result.get("observe_rows"):
@@ -3351,15 +3566,15 @@ def _html_cell_class(text, header=None):
     text = str(text or "")
     header = str(header or "")
     classes = []
-    if header in {"涨幅", "今日均涨", "5日均涨", "5日超额"} and re.search(r"^-?\d+(?:\.\d+)?%$", text):
+    if header in {"涨幅", "今日均涨", "5日均涨", "5日超额", "5日", "20日", "换手"} and re.search(r"^-?\d+(?:\.\d+)?%$", text):
         value = _to_float(text)
         if value is not None and value > 0:
             classes.append("num-up")
         elif value is not None and value < 0:
             classes.append("num-down")
-    positive_words = ["可操作", "核心盯盘", "重点关注", "主升延续", "扩散发酵", "梯队强", "承接强", "封板近似强"]
-    observe_words = ["观察", "稳定观察", "修复承接", "C题材观察", "D弱相关", "触板回落", "冲高回落"]
-    risk_words = ["回避", "硬拦截", "风险", "分歧退潮", "高潮加速", "炸板", "承接弱", "跌破"]
+    positive_words = ["可操作", "核心盯盘", "重点关注", "主升延续", "扩散发酵", "梯队强", "承接强", "封板近似强", "A早期胚子", "B右侧确认"]
+    observe_words = ["观察", "稳定观察", "修复承接", "C题材观察", "C龙头已成", "D弱相关", "触板回落", "冲高回落"]
+    risk_words = ["回避", "硬拦截", "风险", "分歧退潮", "高潮加速", "炸板", "承接弱", "跌破", "D过热回避"]
     if any(word in text for word in risk_words):
         classes.append("tag-risk")
     elif any(word in text for word in positive_words):
