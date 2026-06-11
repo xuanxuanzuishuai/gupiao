@@ -12,7 +12,7 @@
     接着运行短线自适应模型工作流并按健康验证结果决定是否落库；
     最后输出行业热点、关注上升板块和龙头股报告。
 """
-
+import func
 import get_gu_piao_info
 import analysis_industry_hotspot
 import analysis_emotion_leader_watch
@@ -237,6 +237,7 @@ if __name__ == "__main__":
         f"盘中关注池最新报告: {intraday_focus_summary.get('output_path') or '--'}",
         flush=True,
     )
+    func.logInfo('执行结束')
     # long_runway_summary = run_stage(
     #     f"每日{LONG_RUNWAY_MODEL_DISPLAY}中长期跟踪",
     #     analysis_gu_piao_history_long_runway_model,
