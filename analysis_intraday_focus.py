@@ -2880,6 +2880,10 @@ def build_intraday_focus(
                 "trigger": scored.get("trigger"),
                 "invalid": scored.get("invalid"),
                 "current": (quote or {}).get("current"),
+                "prev_close": (quote or {}).get("prev_close"),
+                "open": (quote or {}).get("open"),
+                "high": (quote or {}).get("high"),
+                "low": (quote or {}).get("low"),
                 "change_pct": (quote or {}).get("change_pct"),
                 "open_gap_pct": (quote or {}).get("open_gap_pct"),
                 "day_position": scored.get("day_position"),
@@ -3224,6 +3228,11 @@ def _is_confirm_participation(row):
     quality = str(_row_get(row, "intraday_quality") or "")
     quality_score = _to_float(_row_get(row, "intraday_quality_score")) or 0.0
     lifecycle = str(_row_get(row, "theme_lifecycle") or "")
+    current = _to_float(_row_get(row, "current"))
+    prev_close = _to_float(_row_get(row, "prev_close"))
+    open_price = _to_float(_row_get(row, "open"))
+    change_pct = _to_float(_row_get(row, "change_pct"))
+    warnings = str(_row_get(row, "warnings") or "")
 
     if level not in {"核心盯盘", "重点关注"}:
         return False
@@ -3238,6 +3247,24 @@ def _is_confirm_participation(row):
     if state not in {"盘中强势", "修复走强"}:
         return False
     if quality not in {"承接强", "修复承接", "高位承接", "尾盘强承接", "尾盘修复"}:
+        return False
+    if current is not None and prev_close is not None and current < prev_close:
+        return False
+    if current is not None and open_price is not None and current < open_price:
+        return False
+    if (
+        board_conclusion == "可跟踪但等确认"
+        and lifecycle == "单点试探"
+        and quality not in {"承接强", "高位承接", "尾盘强承接"}
+        and state != "盘中强势"
+        and (change_pct is None or change_pct < 3)
+    ):
+        return False
+    if (
+        ("少数股拉动" in warnings or "成交过度集中" in warnings)
+        and quality == "修复承接"
+        and (change_pct is None or change_pct < 3)
+    ):
         return False
     return quality_score >= 5
 
