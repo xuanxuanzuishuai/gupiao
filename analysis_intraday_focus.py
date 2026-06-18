@@ -62,6 +62,7 @@ DEFAULT_INDUSTRY_REVIEW_DAYS = 5
 DEFAULT_EVENT_LOOKBACK_DAYS = 14
 DEFAULT_EVENT_SCAN_LIMIT = 25
 DEFAULT_HTML_HIDE_CODE_PREFIXES = ("688", "920")
+DEFAULT_HTML_COLLAPSED_SECTIONS = {"风险覆盖观察", "事件催化观察", "数据口径", "全量明细"}
 EVENT_RISK_PATTERNS = [
     ("终止重大资产重组", 10.0, True),
     ("终止筹划重大资产重组", 10.0, True),
@@ -3216,6 +3217,62 @@ def _action_reason(row):
     return "；".join(dict.fromkeys(bits[:6])) or "--"
 
 
+def _is_confirm_participation(row):
+    level = str(_row_get(row, "level") or "")
+    state = str(_row_get(row, "state") or "")
+    board_conclusion = str(_row_get(row, "board_conclusion") or "")
+    quality = str(_row_get(row, "intraday_quality") or "")
+    quality_score = _to_float(_row_get(row, "intraday_quality_score")) or 0.0
+    lifecycle = str(_row_get(row, "theme_lifecycle") or "")
+
+    if level not in {"核心盯盘", "重点关注"}:
+        return False
+    if _is_risk_blocked(row) or _is_risk_downgraded(row):
+        return False
+    if _has_event_risk(row) or _is_touch_fade(row) or _has_intraday_quality_risk(row):
+        return False
+    if board_conclusion in {"弱观察", "过热不追", "分歧回避"}:
+        return False
+    if lifecycle in {"高潮加速", "分歧退潮"}:
+        return False
+    if state not in {"盘中强势", "修复走强"}:
+        return False
+    if quality not in {"承接强", "修复承接", "高位承接", "尾盘强承接", "尾盘修复"}:
+        return False
+    return quality_score >= 5
+
+
+def _confirm_participation_mode(row):
+    quality = str(_row_get(row, "intraday_quality") or "")
+    state = str(_row_get(row, "state") or "")
+    lifecycle = str(_row_get(row, "theme_lifecycle") or "")
+    leader_change = str(_row_get(row, "leader_transition_label") or "")
+    change_pct = _to_float(_row_get(row, "change_pct"))
+
+    if change_pct is not None and change_pct >= 5:
+        return "强势确认"
+    if quality in {"承接强", "高位承接", "尾盘强承接"} and state == "盘中强势":
+        return "突破确认"
+    if quality in {"修复承接", "尾盘修复"} or state == "修复走强":
+        return "回踩确认"
+    if "新晋" in leader_change or "排名上升" in leader_change:
+        return "二次确认"
+    if lifecycle == "启动":
+        return "启动确认"
+    return "承接确认"
+
+
+def _confirm_participation_focus(row):
+    trigger = str(_row_get(row, "trigger") or "")
+    if "不追" in trigger and "等回踩" in trigger:
+        return "高位不追，等回踩不破或放量突破"
+    if "站稳" in trigger:
+        return "站稳关键位后再上攻"
+    if "突破" in trigger:
+        return "突破日高确认"
+    return trigger or "只看承接确认，不追急拉"
+
+
 def _avoid_reason(row):
     risk = str(_row_get(row, "risk_overlay_display") or "")
     event = str(_row_get(row, "event_display") or "")
@@ -3237,6 +3294,7 @@ def _build_action_sections(result_frame, limit=8):
     if result_frame is None or result_frame.empty:
         return {
             "action_group_counts": {},
+            "confirm_rows": [],
             "actionable_rows": [],
             "observe_rows": [],
             "avoid_rows": [],
@@ -3251,6 +3309,7 @@ def _build_action_sections(result_frame, limit=8):
         bucket: int((frame["_action_bucket"] == bucket).sum())
         for bucket in ["可操作", "观察", "回避", "放弃"]
     }
+    confirm_rows = frame[frame.apply(_is_confirm_participation, axis=1)].head(int(limit or 8)).copy()
 
     def rows_for(bucket, row_limit):
         rows = frame[frame["_action_bucket"] == bucket].head(int(row_limit or limit)).copy()
@@ -3259,53 +3318,168 @@ def _build_action_sections(result_frame, limit=8):
 
     return {
         "action_group_counts": counts,
+        "confirm_rows": confirm_rows.drop(
+            columns=["_action_bucket", "_sort_change_pct", "_sort_score"],
+            errors="ignore",
+        ).to_dict("records"),
         "actionable_rows": rows_for("可操作", limit),
         "observe_rows": rows_for("观察", limit),
         "avoid_rows": rows_for("回避", limit),
     }
 
 
-def render_markdown(result):
+def _stock_brief(rows, limit=4):
+    parts = []
+    for row in list(rows or [])[: int(limit or 4)]:
+        code = _md_cell(row.get("stock_code"))
+        name = _md_cell(row.get("stock_name"))
+        pct = row.get("change_pct")
+        pct_text = f",{pct}%" if pct is not None else ""
+        parts.append(f"{name}({code}{pct_text})")
+    return " / ".join(parts) or "--"
+
+
+def _board_brief(items, conclusions=None, limit=5):
+    conclusion_set = set(conclusions or [])
+    parts = []
+    for item in items or []:
+        conclusion = str(item.get("conclusion") or "")
+        if conclusion_set and conclusion not in conclusion_set:
+            continue
+        board = str(item.get("board_name") or "--")
+        cycle = str(item.get("theme_lifecycle") or "")
+        rank = _rank_text(item.get("latest_hot_rank"))
+        label = f"{board}"
+        if cycle and cycle != "--":
+            label += f"({cycle})"
+        if rank != "--":
+            label += f"/热{rank}"
+        parts.append(label)
+        if len(parts) >= int(limit or 5):
+            break
+    return " / ".join(parts) or "--"
+
+
+def _decision_summary_lines(result):
+    action_counts = result.get("action_group_counts") or {}
+    confirm_rows = result.get("confirm_rows") or []
+    observe_count = action_counts.get("观察", 0)
+    if confirm_rows:
+        posture = f"有{len(confirm_rows)}只确认参与候选，只按触发口径做，不追急拉。"
+    elif observe_count:
+        posture = "暂无干净确认参与，偏观察，等承接或二次确认。"
+    else:
+        posture = "确认参与为空，今天以防守和等待为主。"
+
+    focus_boards = _board_brief(
+        result.get("top_board_reviews") or [],
+        conclusions={"持续稳定关注", "可跟踪但等确认"},
+        limit=5,
+    )
+    overheat_boards = _board_brief(
+        result.get("top_board_reviews") or [],
+        conclusions={"过热不追", "分歧回避"},
+        limit=4,
+    )
+    if overheat_boards == "--":
+        overheat_boards = _stock_brief(result.get("avoid_rows") or [], limit=4)
+
+    return [
+        f"盘中姿态: {posture}",
+        f"主线/可跟踪板块: {focus_boards}",
+        f"优先看: {_stock_brief(confirm_rows, limit=4)}",
+        f"过热/回避只看风向: {overheat_boards}",
+        "阅读顺序: 先看确认参与层；早期胚子只跟踪；候选明细和全量表放后面核对。",
+    ]
+
+
+def _metadata_summary_lines(result):
     lines = [
-        "# 盘中关注池",
-        "",
-        f"- 运行时间: {result.get('run_time')}",
-        f"- 分析交易日: {result.get('target_trade_date')}",
+        f"运行时间: {result.get('run_time')}",
+        f"分析交易日: {result.get('target_trade_date')}",
         (
-            f"- 策略范围: 最近{result.get('strategy_lookback_trade_days')}个交易日"
+            f"策略范围: 最近{result.get('strategy_lookback_trade_days')}个交易日"
             f"({result.get('strategy_date')})，命中策略日{result.get('strategy_date_count')}个，"
             f"策略数: {result.get('strategy_count')}"
         ),
         (
-            f"- 行业主报告: {result.get('industry_date')}，行业龙头候选: "
+            f"行业主报告: {result.get('industry_date')}，行业龙头候选: "
             f"{result.get('leader_candidate_count')}"
         ),
         (
-            f"- 行业近几日比较: {', '.join(result.get('industry_review_dates') or []) or '--'}，"
+            f"行业近几日比较: {', '.join(result.get('industry_review_dates') or []) or '--'}，"
             f"覆盖板块: {result.get('board_review_count')}"
         ),
-        f"- 龙头变化跟踪: {result.get('leader_transition_count')}条板块龙头历史",
+        f"龙头变化跟踪: {result.get('leader_transition_count')}条板块龙头历史",
         (
-            f"- 风险覆盖模型: {result.get('risk_overlay_date') or '--'}，"
+            f"风险覆盖模型: {result.get('risk_overlay_date') or '--'}，"
             f"候选覆盖 {result.get('risk_overlay_count')}/{result.get('candidate_count')}，"
             f"高风险 {result.get('risk_overlay_high_count')}，"
             f"硬拦截 {result.get('risk_overlay_blocked_count')}，"
             f"降级 {result.get('risk_overlay_downgrade_count')}"
         ),
         (
-            f"- 事件催化扫描: 近{result.get('event_lookback_days')}日，"
+            f"事件催化扫描: 近{result.get('event_lookback_days')}日，"
             f"{result.get('event_context_count')}/{result.get('event_scan_limit')}只"
         ),
         (
-            f"- 情绪龙头胚子池: {result.get('emotion_watch_date') or '--'}，"
+            f"情绪龙头胚子池: {result.get('emotion_watch_date') or '--'}，"
             f"核心展示 {result.get('emotion_watch_count') or 0}/全量{result.get('emotion_watch_total_count') or 0}"
         ),
-        "- 新增研判口径: 事件真实性分级、题材生命周期、板块梯队强弱、盘口质量近似判断",
-        f"- 实时行情覆盖: {result.get('quote_count')}/{result.get('candidate_count')}",
-        f"- 大盘: {_market_text(result.get('market'))}",
+        "新增研判口径: 事件真实性分级、题材生命周期、板块梯队强弱、盘口质量近似判断",
+        f"实时行情覆盖: {result.get('quote_count')}/{result.get('candidate_count')}",
+        f"大盘: {_market_text(result.get('market'))}",
     ]
     if result.get("warnings"):
-        lines.append(f"- 提醒: {'；'.join(result.get('warnings') or [])}")
+        lines.append(f"提醒: {'；'.join(result.get('warnings') or [])}")
+    return lines
+
+
+def _append_emotion_watch_table(lines, title, rows):
+    if not rows:
+        return
+    lines.append(f"## {title}")
+    lines.append("")
+    lines.append("|阶段|代码|名称|板块|分数|5日|20日|额比|换手|现价|涨幅|盘口|热榜|触发|放弃|")
+    lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|")
+    for row in rows or []:
+        quality = str(row.get("intraday_quality") or "--")
+        limit_quality = str(row.get("limit_quality") or "")
+        if limit_quality and limit_quality not in {"--", "未触板"} and limit_quality not in quality:
+            quality = f"{quality}/{limit_quality}"
+        if _to_bool(row.get("limit_fade")) and "回落" not in quality:
+            quality = f"{quality}/回落"
+        lines.append(
+            "|{stage}|{code}|{name}|{industry}|{score}|{chg5}|{chg20}|{ratio}|{turnover}|{current}|{pct}|{quality}|{leader}|{trigger}|{invalid}|".format(
+                stage=_md_cell(row.get("stage")),
+                code=_md_cell(row.get("stock_code")),
+                name=_md_cell(row.get("stock_name")),
+                industry=_md_cell(_short_industry_label(row.get("industry"), limit=2)),
+                score=_md_num(row.get("score")),
+                chg5=_md_pct(row.get("change_5d")),
+                chg20=_md_pct(row.get("change_20d")),
+                ratio=_md_num(row.get("amount_ratio_5d")),
+                turnover=_md_pct(row.get("turnover_rate")),
+                current=_md_num(row.get("current")),
+                pct=_md_pct(row.get("change_pct")),
+                quality=_md_cell(quality),
+                leader=_md_cell(row.get("leader_context")),
+                trigger=_md_cell(row.get("trigger")),
+                invalid=_md_cell(row.get("invalid")),
+            )
+        )
+    lines.append("")
+
+
+def render_markdown(result):
+    lines = [
+        "# 盘中关注池",
+        "",
+        "## 今日结论",
+        "",
+    ]
+    for item in _decision_summary_lines(result):
+        lines.append(f"- {item}")
     lines.append("")
 
     action_counts = result.get("action_group_counts") or {}
@@ -3314,14 +3488,42 @@ def render_markdown(result):
         lines.append("")
         lines.append(
             f"- 可操作: {action_counts.get('可操作', 0)}；"
+            f"确认参与: {len(result.get('confirm_rows') or [])}；"
             f"观察: {action_counts.get('观察', 0)}；"
             f"回避: {action_counts.get('回避', 0)}；"
             f"放弃: {action_counts.get('放弃', 0)}"
         )
         lines.append("")
 
+    if result.get("confirm_rows"):
+        lines.append("## 确认参与层")
+        lines.append("")
+        lines.append("|代码|名称|板块|参与方式|确认理由|盘口|现价|涨幅|参与口径|失效线|")
+        lines.append("|---|---|---|---|---|---|---:|---:|---|---|")
+        for row in result.get("confirm_rows") or []:
+            lines.append(
+                "|{code}|{name}|{board}|{mode}|{reason}|{quality}|{current}|{pct}|{focus}|{invalid}|".format(
+                    code=_md_cell(row.get("stock_code")),
+                    name=_md_cell(row.get("stock_name")),
+                    board=_md_cell(row.get("board_display") or row.get("board_name")),
+                    mode=_md_cell(_confirm_participation_mode(row)),
+                    reason=_md_cell(_action_reason(row)),
+                    quality=_md_cell(row.get("intraday_quality")),
+                    current=row.get("current") if row.get("current") is not None else "--",
+                    pct=f"{row.get('change_pct')}%" if row.get("change_pct") is not None else "--",
+                    focus=_md_cell(_confirm_participation_focus(row)),
+                    invalid=_md_cell(row.get("invalid")),
+                )
+            )
+        lines.append("")
+    else:
+        lines.append("## 确认参与层")
+        lines.append("")
+        lines.append("- 暂无低风险且承接达标的确认参与候选。")
+        lines.append("")
+
     if result.get("actionable_rows"):
-        lines.append("## 今日可操作候选")
+        lines.append("## 候选明细")
         lines.append("")
         lines.append("|代码|名称|板块|层级|理由|题材周期|盘口|现价|涨幅|触发|放弃|")
         lines.append("|---|---|---|---|---|---|---|---:|---:|---|---|")
@@ -3340,46 +3542,30 @@ def render_markdown(result):
                     trigger=_md_cell(row.get("trigger")),
                     invalid=_md_cell(row.get("invalid")),
                 )
-            )
+        )
         lines.append("")
     else:
-        lines.append("## 今日可操作候选")
+        lines.append("## 候选明细")
         lines.append("")
-        lines.append("- 暂无干净的可操作候选，优先观察而不是强行出手。")
+        lines.append("- 暂无干净的候选明细，优先观察而不是强行出手。")
         lines.append("")
 
-    if result.get("emotion_watch_rows"):
-        lines.append("## 情绪龙头胚子池")
-        lines.append("")
-        lines.append("|阶段|代码|名称|板块|分数|5日|20日|额比|换手|现价|涨幅|盘口|热榜|触发|放弃|")
-        lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|")
-        for row in result.get("emotion_watch_rows") or []:
-            quality = str(row.get("intraday_quality") or "--")
-            limit_quality = str(row.get("limit_quality") or "")
-            if limit_quality and limit_quality not in {"--", "未触板"} and limit_quality not in quality:
-                quality = f"{quality}/{limit_quality}"
-            if _to_bool(row.get("limit_fade")) and "回落" not in quality:
-                quality = f"{quality}/回落"
-            lines.append(
-                "|{stage}|{code}|{name}|{industry}|{score}|{chg5}|{chg20}|{ratio}|{turnover}|{current}|{pct}|{quality}|{leader}|{trigger}|{invalid}|".format(
-                    stage=_md_cell(row.get("stage")),
-                    code=_md_cell(row.get("stock_code")),
-                    name=_md_cell(row.get("stock_name")),
-                    industry=_md_cell(_short_industry_label(row.get("industry"), limit=2)),
-                    score=_md_num(row.get("score")),
-                    chg5=_md_pct(row.get("change_5d")),
-                    chg20=_md_pct(row.get("change_20d")),
-                    ratio=_md_num(row.get("amount_ratio_5d")),
-                    turnover=_md_pct(row.get("turnover_rate")),
-                    current=_md_num(row.get("current")),
-                    pct=_md_pct(row.get("change_pct")),
-                    quality=_md_cell(quality),
-                    leader=_md_cell(row.get("leader_context")),
-                    trigger=_md_cell(row.get("trigger")),
-                    invalid=_md_cell(row.get("invalid")),
-                )
-            )
-        lines.append("")
+    emotion_rows = result.get("emotion_watch_rows") or []
+    if emotion_rows:
+        early_rows = [
+            row for row in emotion_rows if str(row.get("stage") or "").startswith("A")
+        ]
+        right_confirm_rows = [
+            row for row in emotion_rows if str(row.get("stage") or "").startswith("B")
+        ]
+        other_emotion_rows = [
+            row
+            for row in emotion_rows
+            if not str(row.get("stage") or "").startswith(("A", "B"))
+        ]
+        _append_emotion_watch_table(lines, "早期胚子池", early_rows)
+        _append_emotion_watch_table(lines, "右侧确认补充", right_confirm_rows)
+        _append_emotion_watch_table(lines, "其他情绪观察", other_emotion_rows)
 
     if result.get("observe_rows"):
         lines.append("## 只观察候选")
@@ -3402,7 +3588,7 @@ def render_markdown(result):
         lines.append("")
 
     if result.get("avoid_rows"):
-        lines.append("## 高风险/回避")
+        lines.append("## 过热/回避风向")
         lines.append("")
         lines.append("|代码|名称|板块|回避原因|现价|涨幅|口径|")
         lines.append("|---|---|---|---|---:|---:|---|")
@@ -3502,6 +3688,13 @@ def render_markdown(result):
                 )
             )
         lines.append("")
+    lines.append("## 数据口径")
+    lines.append("")
+    for item in _metadata_summary_lines(result):
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("## 全量明细")
+    lines.append("")
     lines.append(
         "|排名|代码|名称|板块|层级|来源|分数|现价|涨幅|题材|梯队|盘口|龙头变化|事件|风控|建议|触发|放弃|提醒|"
     )
@@ -3572,7 +3765,7 @@ def _html_cell_class(text, header=None):
             classes.append("num-up")
         elif value is not None and value < 0:
             classes.append("num-down")
-    positive_words = ["可操作", "核心盯盘", "重点关注", "主升延续", "扩散发酵", "梯队强", "承接强", "封板近似强", "A早期胚子", "B右侧确认"]
+    positive_words = ["可操作", "确认", "核心盯盘", "重点关注", "主升延续", "扩散发酵", "梯队强", "承接强", "封板近似强", "A早期胚子", "B右侧确认"]
     observe_words = ["观察", "稳定观察", "修复承接", "C题材观察", "C龙头已成", "D弱相关", "触板回落", "冲高回落"]
     risk_words = ["回避", "硬拦截", "风险", "分歧退潮", "高潮加速", "炸板", "承接弱", "跌破", "D过热回避"]
     if any(word in text for word in risk_words):
@@ -3628,6 +3821,7 @@ def _markdown_to_html(markdown, hide_code_prefixes=None):
     lines = str(markdown or "").splitlines()
     output = []
     in_list = False
+    in_section = False
     index = 0
 
     def close_list():
@@ -3635,6 +3829,14 @@ def _markdown_to_html(markdown, hide_code_prefixes=None):
         if in_list:
             output.append("</ul>")
             in_list = False
+
+    def close_section():
+        nonlocal in_section
+        close_list()
+        if in_section:
+            output.append("</div>")
+            output.append("</section>")
+            in_section = False
 
     while index < len(lines):
         line = lines[index].rstrip()
@@ -3660,15 +3862,27 @@ def _markdown_to_html(markdown, hide_code_prefixes=None):
             )
             continue
         if stripped.startswith("# "):
-            close_list()
+            close_section()
             output.append(f"<h1>{_html_text(stripped[2:].strip())}</h1>")
         elif stripped.startswith("## "):
-            close_list()
+            close_section()
             title = stripped[3:].strip()
             anchor = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", title).strip("-")
-            output.append(f'<section class="report-section" id="{_html_text(anchor)}">')
+            collapsed = title in DEFAULT_HTML_COLLAPSED_SECTIONS
+            collapsed_class = " is-collapsed" if collapsed else ""
+            hidden_attr = " hidden" if collapsed else ""
+            button_text = "展开" if collapsed else "收起"
+            output.append(
+                f'<section class="report-section{collapsed_class}" id="{_html_text(anchor)}">'
+            )
+            output.append('<div class="section-heading">')
             output.append(f"<h2>{_html_text(title)}</h2>")
-            output.append("</section>")
+            output.append(
+                f'<button class="section-toggle" type="button" aria-expanded="{str(not collapsed).lower()}">{button_text}</button>'
+            )
+            output.append("</div>")
+            output.append(f'<div class="section-body"{hidden_attr}>')
+            in_section = True
         elif stripped.startswith("- "):
             if not in_list:
                 output.append('<ul class="summary-list">')
@@ -3678,7 +3892,7 @@ def _markdown_to_html(markdown, hide_code_prefixes=None):
             close_list()
             output.append(f"<p>{_html_text(stripped)}</p>")
         index += 1
-    close_list()
+    close_section()
     return "\n".join(output)
 
 
@@ -3792,12 +4006,35 @@ h1 {{
   padding-top: 2px;
   border-top: 1px solid var(--line);
 }}
+.section-heading {{
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}}
 h2 {{
   margin: 0 0 10px;
   padding-top: 10px;
   font-size: 18px;
   line-height: 1.3;
   letter-spacing: 0;
+}}
+.section-toggle {{
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--blue);
+  background: var(--blue-bg);
+  font-size: 13px;
+  cursor: pointer;
+}}
+.section-toggle:hover {{
+  border-color: #9bbce2;
+}}
+.section-body[hidden] {{
+  display: none;
 }}
 p {{
   margin: 10px 0;
@@ -3879,6 +4116,22 @@ input.addEventListener('input', () => {{
   const keyword = input.value.trim().toLowerCase();
   document.querySelectorAll('tbody tr').forEach(row => {{
     row.classList.toggle('hidden', keyword && !row.innerText.toLowerCase().includes(keyword));
+  }});
+}});
+document.querySelectorAll('.section-toggle').forEach(button => {{
+  button.addEventListener('click', () => {{
+    const section = button.closest('.report-section');
+    const body = section ? section.querySelector('.section-body') : null;
+    if (!body) return;
+    const shouldOpen = body.hasAttribute('hidden');
+    if (shouldOpen) {{
+      body.removeAttribute('hidden');
+    }} else {{
+      body.setAttribute('hidden', '');
+    }}
+    section.classList.toggle('is-collapsed', !shouldOpen);
+    button.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
+    button.textContent = shouldOpen ? '收起' : '展开';
   }});
 }});
 const refreshStatus = document.getElementById('refreshStatus');
